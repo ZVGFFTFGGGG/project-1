@@ -207,6 +207,7 @@ jobs:
       # is served from Azure blob storage, which Netfree blocks. The extension
       # downloads the release asset directly and also shows its link for IDM.
       - name: Publish as Release (Netfree-friendly download)
+        continue-on-error: true
         if: success()
         env:
           GH_TOKEN: ${{ github.token }}
@@ -642,6 +643,7 @@ jobs:
       # Netfree; see the resolve-video job for why). The extension pulls it directly and
       # shows its link for IDM.
       - name: Publish as Release (Netfree-friendly download)
+        continue-on-error: true
         if: success()
         env:
           GH_TOKEN: ${{ github.token }}
