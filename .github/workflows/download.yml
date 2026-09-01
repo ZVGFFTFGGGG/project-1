@@ -644,23 +644,62 @@ jobs:
           path: merged
           merge-multiple: true
 
-      - name: Zip the collection
+      - name: Zip the collection (split under 2GB limit)
         run: |
           mkdir -p out
           if [ -z "$(ls -A merged 2>/dev/null)" ]; then
             echo "::error::every item in this collection failed to download"
             exit 1
           fi
-          # Using zip -m moves files into the zip and removes them from disk to prevent double space usage
-          (cd merged && zip -r -m -0 "../out/${{ needs.enumerate.outputs.collection_name }}.zip" .)
+
+          python - <<'PY'
+          import os, sys, zipfile
+
+          base_name = """${{ needs.enumerate.outputs.collection_name }}""".strip() or "collection"
+          merged_dir = "merged"
+          out_dir = "out"
+          MAX_SIZE = int(1.9 * 1024 * 1024 * 1024) # 1.9 GB per zip limit
+
+          all_files = []
+          for root, _, files in os.walk(merged_dir):
+              for f in files:
+                  full = os.path.join(root, f)
+                  rel = os.path.relpath(full, merged_dir)
+                  all_files.append((full, rel, os.path.getsize(full)))
+
+          total_size = sum(f[2] for f in all_files)
+          print(f"Total size to package: {total_size / (1024*1024):.2f} MB across {len(all_files)} files")
+
+          if total_size <= MAX_SIZE:
+              zip_path = os.path.join(out_dir, f"{base_name}.zip")
+              with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_STORED) as zf:
+                  for full, rel, _ in all_files:
+                      zf.write(full, rel)
+              print(f"Created single ZIP: {zip_path}")
+          else:
+              part = 1
+              cur_size = 0
+              zf = None
+              for full, rel, sz in all_files:
+                  if zf is None or (cur_size + sz > MAX_SIZE and cur_size > 0):
+                      if zf:
+                          zf.close()
+                      zip_path = os.path.join(out_dir, f"{base_name}_part{part}.zip")
+                      zf = zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_STORED)
+                      print(f"Starting new ZIP: {zip_path}")
+                      part += 1
+                      cur_size = 0
+                  zf.write(full, rel)
+                  cur_size += sz
+              if zf:
+                  zf.close()
+          PY
+
           rm -rf merged
           ls -lh out
 
-      # Publish the single ZIP as a Release asset (github.com download that works behind
-      # Netfree; see the resolve-video job for why). The extension pulls it directly and
-      # shows its link for IDM.
+      # Publish the ZIPs as Release assets (github.com download that works behind Netfree)
       - name: Publish as Release (Netfree-friendly download)
-        continue-on-error: true
         if: success()
         env:
           GH_TOKEN: ${{ github.token }}
