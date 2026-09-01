@@ -615,20 +615,27 @@ jobs:
           retention-days: 1
           compression-level: 0
 
-  # --------------------------------------------------- collection: zip it all up
-  package:
+  package: # collection: zip it all up
     if: always() && (inputs.mode == 'collection' || inputs.mode == 'list') && needs.enumerate.result == 'success'
     needs: [enumerate, download-item]
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
-      - name: Free disk space
+      - name: Maximize runner disk space
         run: |
+          echo "=== Disk space BEFORE cleanup ==="
+          df -h /
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /usr/local/lib/android
           sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          df -h
+          sudo rm -rf /opt/hostedtoolcache
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/local/share/powershell
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf /usr/lib/jvm
+          sudo docker system prune -af --volumes || true
+          echo "=== Disk space AFTER cleanup ==="
+          df -h /
 
       - name: Collect item artifacts
         uses: actions/download-artifact@v4
@@ -644,8 +651,10 @@ jobs:
             echo "::error::every item in this collection failed to download"
             exit 1
           fi
-          (cd merged && zip -r -q "../out/${{ needs.enumerate.outputs.collection_name }}.zip" .)
-          echo "packaged $(find merged -type f | wc -l) of ${{ needs.enumerate.outputs.item_count }} items"
+          # Using zip -m moves files into the zip and removes them from disk to prevent double space usage
+          (cd merged && zip -r -m -0 "../out/${{ needs.enumerate.outputs.collection_name }}.zip" .)
+          rm -rf merged
+          ls -lh out
 
       # Publish the single ZIP as a Release asset (github.com download that works behind
       # Netfree; see the resolve-video job for why). The extension pulls it directly and
@@ -655,20 +664,15 @@ jobs:
         if: success()
         env:
           GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }} # these jobs don't checkout, so gh needs this
+          GH_REPO: ${{ github.repository }}
           TAG: dl-${{ inputs.request_id }}
         run: |
           gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
           gh release create "$TAG" --title "$TAG" --notes "Automated download - safe to delete."
-          # gh treats each asset arg as a glob pattern, so yt-dlp's [id] brackets (and any
-          # * ? in a title) match nothing -> "no matches found". Escape those metachars so
-          # gh matches the literal file. find handles spaces; sed backslash-escapes globs.
           find out -type f -print0 | while IFS= read -r -d '' f; do
             esc=$(printf '%s' "$f" | sed 's/[][*?\\]/\\&/g')
             gh release upload "$TAG" "$esc" --clobber
           done
-          # Keep the Releases page tidy: drop auto bundles beyond the newest 25.
-          # Wrapped so an empty list (grep exit 1 under pipefail) never fails the job.
           {
             gh release list --limit 200 --json tagName,createdAt \
               --jq 'sort_by(.createdAt) | reverse | .[].tagName' 2>/dev/null \
