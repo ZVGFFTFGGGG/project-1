@@ -182,7 +182,7 @@ jobs:
         with:
           name: dl-${{ inputs.request_id }}
           path: out/
-          retention-days: 1
+          retention-days: 3
           if-no-files-found: error
           compression-level: 0
 
@@ -611,7 +611,7 @@ jobs:
         with:
           name: dl-${{ inputs.request_id }}-item-${{ matrix.batch.i }}
           path: out/
-          retention-days: 1
+          retention-days: 3
           compression-level: 0
           if-no-files-found: ignore
 
@@ -724,6 +724,6 @@ jobs:
         with:
           name: dl-${{ inputs.request_id }}
           path: out/
-          retention-days: 1
+          retention-days: 3
           if-no-files-found: error
           compression-level: 0
