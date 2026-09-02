@@ -619,7 +619,7 @@ jobs:
     if: always() && (inputs.mode == 'collection' || inputs.mode == 'list') && needs.enumerate.result == 'success'
     needs: [enumerate, download-item]
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 120
     steps:
       - name: Maximize runner disk space
         run: |
