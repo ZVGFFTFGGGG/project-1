@@ -607,13 +607,13 @@ jobs:
         run: rm -f cookies.txt
 
       - name: Upload batch artifact
-        if: hashFiles('out/**') != ''
         uses: actions/upload-artifact@v4
         with:
           name: dl-${{ inputs.request_id }}-item-${{ matrix.batch.i }}
           path: out/
           retention-days: 1
           compression-level: 0
+          if-no-files-found: ignore
 
   package: # collection: zip it all up
     if: always() && (inputs.mode == 'collection' || inputs.mode == 'list') && needs.enumerate.result == 'success'
