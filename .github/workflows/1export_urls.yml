@@ -1,0 +1,89 @@
+name: Export Channel URLs
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel_url:
+        description: 'כתובת הערוץ או הפלייליסט'
+        required: true
+        default: 'https://www.youtube.com/@LatestSightings'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install yt-dlp
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -U yt-dlp
+
+      - name: Extract all URLs
+        run: |
+          mkdir -p out
+          
+          # ניקוי סלאש בסוף הכתובת אם קיים
+          RAW_URL="${{ inputs.channel_url }}"
+          CLEAN_URL="${RAW_URL%/}"
+          
+          echo "מתחיל חילוץ עבור: $CLEAN_URL"
+          
+          # בדיקה האם מדובר בפלייליסט ישיר
+          if [[ "$CLEAN_URL" == *"playlist?list="* ]]; then
+            echo "זוהה קישור לפלייליסט, מחלץ..."
+            yt-dlp --flat-playlist \
+              --ignore-errors \
+              --retries 10 \
+              --fragment-retries 10 \
+              --print "%(title)s - %(url)s" \
+              "$CLEAN_URL" >> out/temp_urls.txt || true
+          else
+            echo "זוהה ערוץ, מחלץ מכל הלשוניות..."
+            TABS=("videos" "shorts" "streams" "podcasts")
+            
+            for TAB in "${TABS[@]}"; do
+              echo "מחלץ מלשונית: $TAB"
+              yt-dlp --flat-playlist \
+                --ignore-errors \
+                --retries 10 \
+                --fragment-retries 10 \
+                --print "%(title)s - %(url)s" \
+                "$CLEAN_URL/$TAB" >> out/temp_urls.txt 2>/dev/null || true
+            done
+            
+            # גיבוי: אם לא נמצא תוכן באף לשונית (ערוצים ישנים/מבנה מיוחד)
+            if [ ! -s out/temp_urls.txt ]; then
+              echo "לא נמצאו סרטונים בלשוניות, מנסה ישירות מהכתובת הראשית..."
+              yt-dlp --flat-playlist \
+                --ignore-errors \
+                --retries 10 \
+                --fragment-retries 10 \
+                --print "%(title)s - %(url)s" \
+                "$CLEAN_URL" >> out/temp_urls.txt || true
+            fi
+          fi
+
+          # הסרת שורות כפולות ושמירה על הסדר
+          if [ -s out/temp_urls.txt ]; then
+            awk '!seen[$0]++' out/temp_urls.txt > out/all_urls.txt
+            rm -f out/temp_urls.txt
+          else
+            echo "לא נמצאו סרטונים כלל." > out/all_urls.txt
+          fi
+
+          COUNT=$(grep -c " - " out/all_urls.txt || echo 0)
+          echo "נמצאו סך הכל $COUNT סרטונים ייחודיים!"
+          
+          (cd out && zip -0 all_urls.zip all_urls.txt)
+
+      - name: Publish URLs as Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: urls-${{ github.run_id }}
+        run: |
+          gh release create "$TAG" --title "Channel URLs (${{ github.run_id }})" --notes "רשימת סרטונים שחולצה מ: ${{ inputs.channel_url }}"
+          gh release upload "$TAG" out/all_urls.zip --clobber
