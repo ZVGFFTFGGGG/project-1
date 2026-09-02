@@ -1,0 +1,46 @@
+name: Export Channel URLs
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel_url:
+        description: 'כתובת הערוץ או הפלייליסט'
+        required: true
+        default: 'https://www.youtube.com/@LatestSightings'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install yt-dlp
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install yt-dlp
+
+      - name: Extract all URLs
+        run: |
+          mkdir -p out
+          yt-dlp --flat-playlist --print "%(title)s - %(url)s" \
+            "${{ inputs.channel_url }}/videos" \
+            "${{ inputs.channel_url }}/shorts" \
+            "${{ inputs.channel_url }}/streams" > out/all_urls.txt || true
+          
+          # אם לא מצא בלשוניות, מנסה ישירות על הקישור הראשי
+          if [ ! -s out/all_urls.txt ]; then
+            yt-dlp --flat-playlist --print "%(title)s - %(url)s" "${{ inputs.channel_url }}" > out/all_urls.txt
+          fi
+          
+          echo "נמצאו סך הכל $(wc -l < out/all_urls.txt) סרטונים!"
+          (cd out && zip -0 all_urls.zip all_urls.txt)
+
+      - name: Publish URLs as Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: urls-${{ github.run_id }}
+        run: |
+          gh release create "$TAG" --title "Channel URLs" --notes "רשימת כל הסרטונים מהערוץ"
+          gh release upload "$TAG" out/all_urls.zip --clobber
