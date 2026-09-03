@@ -7,10 +7,19 @@ on:
         description: 'מילת חיפוש'
         required: true
         type: string
+      sort_by:
+        description: 'מיון לפי: relevance (רגיל) / views (הכי נצפים) / date (הכי חדשים)'
+        required: true
+        default: 'relevance'
+        type: choice
+        options:
+          - 'relevance'
+          - 'views'
+          - 'date'
       max_results:
-        description: 'כמות תוצאות מקסימלית'
+        description: 'כמות תוצאות'
         required: false
-        default: '15'
+        default: '25'
         type: string
 
 permissions:
@@ -35,6 +44,7 @@ jobs:
       - name: Execute Search
         env:
           QUERY: ${{ inputs.query }}
+          SORT_BY: ${{ inputs.sort_by }}
           MAX_RESULTS: ${{ inputs.max_results }}
         run: |
           cat << 'EOF' > search_script.py
@@ -42,22 +52,31 @@ jobs:
           import subprocess
           import os
 
-          query = os.environ.get("QUERY", "")
-          max_results = os.environ.get("MAX_RESULTS", "15")
+          query = os.environ.get("QUERY", "").strip()
+          sort_by = os.environ.get("SORT_BY", "relevance").strip()
+          max_results = int(os.environ.get("MAX_RESULTS", "25"))
+
+          # אם נבחר מיון לפי הכי חדשים
+          if sort_by == "date":
+              search_prefix = f"ytsearchdate{max_results}"
+          # אם נבחר מיון לפי צפיות, נביא יותר תוצאות כדי למיין מתוכן את המובילים
+          elif sort_by == "views":
+              search_prefix = f"ytsearch{max_results * 2}"
+          else:
+              search_prefix = f"ytsearch{max_results}"
 
           cmd = [
               "yt-dlp",
-              f"ytsearch{max_results}:{query}",
+              f"{search_prefix}:{query}",
               "--dump-json",
               "--flat-playlist",
               "--no-warnings"
           ]
 
           proc = subprocess.run(cmd, capture_output=True, text=True)
-          
-          markdown_lines = [f"# תוצאות חיפוש עבור: {query}\n"]
+          items = []
 
-          for i, line in enumerate(proc.stdout.strip().split("\n"), 1):
+          for line in proc.stdout.strip().split("\n"):
               if not line:
                   continue
               try:
@@ -65,19 +84,62 @@ jobs:
                   video_id = data.get("id")
                   title = data.get("title")
                   duration = data.get("duration")
+                  views = data.get("view_count")
                   channel = data.get("uploader") or data.get("channel") or "ערוץ לא ידוע"
                   url = f"https://www.youtube.com/watch?v={video_id}"
 
-                  dur_str = ""
+                  # עיצוב משך זמן
+                  dur_str = "—"
                   if duration:
                       m, s = divmod(int(duration), 60)
                       h, m = divmod(m, 60)
-                      dur_str = f" [{h}:{m:02d}:{s:02d}]" if h else f" [{m:02d}:{s:02d}]"
+                      dur_str = f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
-                  markdown_lines.append(f"{i}. **{title}**{dur_str} - *{channel}*")
-                  markdown_lines.append(f"   קישור: `{url}`\n")
+                  # עיצוב כמות צפיות
+                  views_num = 0
+                  views_str = "—"
+                  if views is not None:
+                      try:
+                          views_num = int(views)
+                          if views_num >= 1_000_000:
+                              views_str = f"{views_num / 1_000_000:.1f}M"
+                          elif views_num >= 1_000:
+                              views_str = f"{views_num / 1_000:.1f}K"
+                          else:
+                              views_str = f"{views_num}"
+                      except:
+                          pass
+
+                  # תאריך
+                  upload_date = data.get("upload_date")
+                  date_str = "—"
+                  if upload_date and len(upload_date) == 8:
+                      date_str = f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:]}"
+
+                  items.append({
+                      "title": title,
+                      "channel": channel,
+                      "duration": dur_str,
+                      "views_str": views_str,
+                      "views_num": views_num,
+                      "date": date_str,
+                      "url": url
+                  })
               except Exception:
                   continue
+
+          # מיון לפי צפיות במידה ונבחר
+          if sort_by == "views":
+              items.sort(key=lambda x: x["views_num"], reverse=True)
+
+          # חיתוך לכמות המבוקשת
+          items = items[:max_results]
+
+          markdown_lines = ["# תוצאות\n"]
+          for i, item in enumerate(items, 1):
+              markdown_lines.append(f"### {i}. {item['title']}")
+              markdown_lines.append(f"- ⏱️ **משך:** `{item['duration']}` | 👀 **צפיות:** `{item['views_str']}` | 📅 **תאריך:** `{item['date']}` | 👤 **ערוץ:** {item['channel']}")
+              markdown_lines.append(f"- 🔗 **קישור:** `{item['url']}`\n")
 
           with open("notes.md", "w", encoding="utf-8") as f:
               f.write("\n".join(markdown_lines))
@@ -89,10 +151,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
-          QUERY: ${{ inputs.query }}
         run: |
-          TAG="search-$(date +%s)"
-          gh release create "$TAG" --title "חיפוש: ${QUERY}" --notes-file notes.md --target main
+          # שימוש במספרים בלבד עבור השם וה-URL כדי למנוע חסימת נטפרי
+          TAG="$(date +%s)"
+          gh release create "$TAG" --title "Data $TAG" --notes-file notes.md --target main
 
       - name: Cleanup Old Search Releases
         if: always()
@@ -100,6 +162,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: |
-          gh release list --limit 50 | grep "search-" | tail -n +6 | awk '{print $1}' | while read -r tag; do
+          # מוחק רק שחרורים שהשם שלהם הוא מספרים בלבד (לא נוגע בהורדות סרטונים)
+          gh release list --limit 50 | awk '{print $1}' | grep -E '^[0-9]+$' | tail -n +6 | while read -r tag; do
             gh release delete "$tag" --yes --cleanup-tag || true
           done
