@@ -1,0 +1,390 @@
+name: playlist
+run-name: pl-${{ inputs.request_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: 'Unique download id (used for run-name + artifact name)'
+        required: true
+        type: string
+      url:
+        description: 'YouTube Playlist URL (e.g. https://www.youtube.com/playlist?list=...)'
+        required: true
+        type: string
+      quality:
+        description: 'best | 1080 | 720 | 480 | audio'
+        required: false
+        default: 'best'
+        type: string
+      cookies_enc:
+        description: 'AES-256-GCM encrypted cookies.txt, base64 (iv|ct|tag). Leave empty for none.'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pl-${{ inputs.request_id }}
+  cancel-in-progress: false
+
+jobs:
+  # ------------------------------------------------- enumerate playlist items
+  enumerate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      batches: ${{ steps.list.outputs.batches }}
+      playlist_name: ${{ steps.list.outputs.name }}
+      item_count: ${{ steps.list.outputs.count }}
+    steps:
+      - name: Validate request id
+        run: |
+          case "${{ inputs.request_id }}" in
+            *[!a-zA-Z0-9-]*|"") echo "::error::request_id must be [a-zA-Z0-9-] only"; exit 1;;
+          esac
+
+      - name: Extract playlist metadata and items
+        id: list
+        env:
+          TARGET_URL: ${{ inputs.url }}
+          COOKIES_ENC: ${{ inputs.cookies_enc }}
+          COOKIE_KEY: ${{ secrets.COOKIE_KEY }}
+        run: |
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet --upgrade yt-dlp cryptography
+          python - <<'PY'
+          import base64, json, os, re, secrets, sys
+          import yt_dlp
+
+          TARGET_URL = os.environ["TARGET_URL"]
+          MAX_ITEMS = 2500
+          CONCURRENCY = 20
+          MAX_BATCH = 30
+
+          cookies_path = None
+          cookies_enc = os.environ.get("COOKIES_ENC", "")
+          cookie_key = os.environ.get("COOKIE_KEY", "")
+          if cookies_enc and cookie_key:
+              from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+              blob = base64.b64decode(cookies_enc)
+              key = bytes.fromhex(cookie_key.strip())
+              iv, ct = blob[:12], blob[12:]
+              try:
+                  data = AESGCM(key).decrypt(iv, ct, None)
+                  with open("cookies.txt", "wb") as f:
+                      f.write(data)
+                  cookies_path = "cookies.txt"
+              except Exception:
+                  print("::error::cookie decryption failed")
+                  sys.exit(1)
+
+          def safe_name(name, limit=100):
+              name = (name or "").strip()
+              if not name or name == "NA":
+                  return "playlist"
+              cleaned = re.sub(r'[ /\\:*?"<>|]+', "_", name)
+              return cleaned[:limit] or "playlist"
+
+          ydl_opts = {
+              "extract_flat": True,
+              "quiet": True,
+              "no_warnings": True,
+              "skip_download": True,
+              "playlistend": MAX_ITEMS,
+          }
+          if cookies_path:
+              ydl_opts["cookiefile"] = cookies_path
+
+          with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+              try:
+                  info = ydl.extract_info(TARGET_URL, download=False)
+              except Exception as e:
+                  print(f"::error::failed to read playlist: {e}")
+                  sys.exit(1)
+
+          playlist_name = safe_name(info.get("title") or info.get("id"))
+          raw_entries = info.get("entries") or []
+
+          items = []
+          for idx, e in enumerate(raw_entries, 1):
+              if not e or len(items) >= MAX_ITEMS:
+                  continue
+              vid = e.get("id")
+              url = e.get("url") or (f"https://www.youtube.com/watch?v={vid}" if vid else None)
+              title = (e.get("title") or "").strip()
+              
+              # Filter deleted/private entries
+              if not vid or not url or "[private video]" in title.lower() or "[deleted video]" in title.lower():
+                  continue
+
+              items.append({
+                  "index": f"{idx:03d}",
+                  "id": vid,
+                  "url": url,
+                  "title": title
+              })
+
+          if os.path.exists("cookies.txt"):
+              os.remove("cookies.txt")
+
+          if not items:
+              print("::error::no playable videos found in this playlist")
+              sys.exit(1)
+
+          target_jobs = min(len(items), CONCURRENCY)
+          batch_size = max(1, -(-len(items) // target_jobs))
+          batch_size = min(batch_size, MAX_BATCH)
+          batches = [
+              {"i": idx, "items": items[start:start + batch_size]}
+              for idx, start in enumerate(range(0, len(items), batch_size))
+          ]
+
+          print(f"Playlist: '{playlist_name}' with {len(items)} items split into {len(batches)} batches.")
+
+          delim = f"ghadelim_{secrets.token_hex(8)}"
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"batches<<{delim}\n{json.dumps(batches)}\n{delim}\n")
+              f.write(f"name={playlist_name}\n")
+              f.write(f"count={len(items)}\n")
+          PY
+
+  # ------------------------------------------------- download batch items in parallel
+  download-item:
+    needs: enumerate
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        batch: ${{ fromJson(needs.enumerate.outputs.batches) }}
+    name: download-item ${{ matrix.batch.i }}
+    steps:
+      - name: Set up Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Install yt-dlp + ffmpeg
+        run: |
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet --upgrade yt-dlp cryptography imageio-ffmpeg curl_cffi
+          if command -v ffmpeg >/dev/null 2>&1; then
+            FFMPEG_BIN=$(command -v ffmpeg)
+          else
+            FFMPEG_BIN=$(python -c "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())")
+            chmod +x "$FFMPEG_BIN"
+          fi
+          echo "FFMPEG_BIN=$FFMPEG_BIN" >> "$GITHUB_ENV"
+
+      - name: Decrypt cookies
+        if: ${{ inputs.cookies_enc != '' }}
+        env:
+          COOKIES_ENC: ${{ inputs.cookies_enc }}
+          COOKIE_KEY: ${{ secrets.COOKIE_KEY }}
+        run: |
+          if [ -z "$COOKIE_KEY" ]; then
+            echo "::error::repository secret COOKIE_KEY is missing"
+            exit 1
+          fi
+          python - <<'PY'
+          import base64, os, sys
+          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+          blob = base64.b64decode(os.environ["COOKIES_ENC"])
+          key = bytes.fromhex(os.environ["COOKIE_KEY"].strip())
+          iv, ct = blob[:12], blob[12:]
+          try:
+              data = AESGCM(key).decrypt(iv, ct, None)
+              with open("cookies.txt", "wb") as f:
+                  f.write(data)
+          except Exception:
+              print("::error::cookie decryption failed")
+              sys.exit(1)
+          PY
+
+      - name: Download batch
+        env:
+          BATCH_JSON: ${{ toJson(matrix.batch.items) }}
+          QUALITY: ${{ inputs.quality }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+        run: |
+          mkdir -p out
+          case "$QUALITY" in
+            audio) FMT_ARGS="-f bestaudio/best -x --audio-format mp3 --audio-quality 0 --embed-metadata" ;;
+            1080)  FMT_ARGS="-f bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b --merge-output-format mp4" ;;
+            720)   FMT_ARGS="-f bv*[height<=720]+ba/b[height<=720]/bv*+ba/b --merge-output-format mp4" ;;
+            480)   FMT_ARGS="-f bv*[height<=480]+ba/b[height<=480]/bv*+ba/b --merge-output-format mp4" ;;
+            *)     FMT_ARGS="-f bv*+ba/b --merge-output-format mp4" ;;
+          esac
+
+          COOKIE_ARGS=""
+          if [ -f cookies.txt ]; then COOKIE_ARGS="--cookies cookies.txt"; fi
+          PROXY_ARGS=""
+          if [ -n "$PROXY_URL" ]; then PROXY_ARGS="--proxy $PROXY_URL"; fi
+
+          printf '%s' "$BATCH_JSON" | python -c "
+          import json, sys
+          for it in json.load(sys.stdin):
+              print(it['url'] + '\t' + it['index'])
+          " > batch.tsv
+
+          run_ytdlp() {
+            local tmpl="$1"; shift
+            yt-dlp \
+              $FMT_ARGS $PROXY_ARGS "$@" \
+              --no-playlist --no-progress --newline \
+              --retries 5 --fragment-retries 10 \
+              --embed-metadata \
+              --remote-components ejs:github \
+              --ffmpeg-location "$FFMPEG_BIN" \
+              -o "$tmpl" \
+              -- "$URL"
+          }
+
+          IMP="generic:impersonate"
+          ALT="youtube:player_client=default,tv,web_safari,mweb,tv_embedded"
+          TOTAL=$(grep -c . batch.tsv)
+          N=0
+          while IFS=$'\t' read -r URL IDX; do
+            [ -z "$URL" ] && continue
+            N=$((N+1))
+            echo "::group::track $IDX ($N of $TOTAL): $URL"
+            TMPL="out/${IDX} - %(title).100B [%(id)s].%(ext)s"
+            if   run_ytdlp "$TMPL" $COOKIE_ARGS --extractor-args "$IMP"; then :
+            elif run_ytdlp "$TMPL" $COOKIE_ARGS --extractor-args "$ALT"; then :
+            elif run_ytdlp "$TMPL" $COOKIE_ARGS --impersonate chrome; then :
+            elif run_ytdlp "$TMPL" --extractor-args "$IMP" --extractor-args "$ALT"; then :
+            else
+              echo "::warning::failed to download $URL"
+            fi
+            echo "::endgroup::"
+          done < batch.tsv
+          rm -f batch.tsv cookies.txt
+
+      - name: Always drop cookies
+        if: always()
+        run: rm -f cookies.txt
+
+      - name: Upload batch artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pl-${{ inputs.request_id }}-item-${{ matrix.batch.i }}
+          path: out/
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+
+  # ------------------------------------------------- zip and publish playlist
+  package:
+    if: always() && needs.enumerate.result == 'success'
+    needs: [enumerate, download-item]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Maximize runner disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/local/share/powershell
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf /usr/lib/jvm
+          sudo docker system prune -af --volumes || true
+          df -h /
+
+      - name: Collect item artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pl-${{ inputs.request_id }}-item-*
+          path: merged
+          merge-multiple: true
+
+      - name: Zip the playlist (split under 2GB limit)
+        run: |
+          mkdir -p out
+          if [ -z "$(ls -A merged 2>/dev/null)" ]; then
+            echo "::error::every item in this playlist failed to download"
+            exit 1
+          fi
+
+          python - <<'PY'
+          import os, sys, zipfile
+
+          base_name = """${{ needs.enumerate.outputs.playlist_name }}""".strip() or "playlist"
+          merged_dir = "merged"
+          out_dir = "out"
+          MAX_SIZE = int(1.9 * 1024 * 1024 * 1024)
+
+          all_files = []
+          for root, _, files in os.walk(merged_dir):
+              for f in sorted(files):
+                  full = os.path.join(root, f)
+                  rel = os.path.relpath(full, merged_dir)
+                  all_files.append((full, rel, os.path.getsize(full)))
+
+          total_size = sum(f[2] for f in all_files)
+          print(f"Total size to package: {total_size / (1024*1024):.2f} MB across {len(all_files)} files")
+
+          if total_size <= MAX_SIZE:
+              zip_path = os.path.join(out_dir, f"{base_name}.zip")
+              with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_STORED) as zf:
+                  for full, rel, _ in all_files:
+                      zf.write(full, rel)
+              print(f"Created single ZIP: {zip_path}")
+          else:
+              part = 1
+              cur_size = 0
+              zf = None
+              for full, rel, sz in all_files:
+                  if zf is None or (cur_size + sz > MAX_SIZE and cur_size > 0):
+                      if zf:
+                          zf.close()
+                      zip_path = os.path.join(out_dir, f"{base_name}_part{part}.zip")
+                      zf = zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_STORED)
+                      print(f"Starting new ZIP: {zip_path}")
+                      part += 1
+                      cur_size = 0
+                  zf.write(full, rel)
+                  cur_size += sz
+              if zf:
+                  zf.close()
+          PY
+
+          rm -rf merged
+          ls -lh out
+
+      - name: Publish as Release (Netfree-friendly download)
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: pl-${{ inputs.request_id }}
+        run: |
+          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" --title "$TAG" --notes "Automated playlist download - safe to delete."
+          find out -type f -print0 | while IFS= read -r -d '' f; do
+            esc=$(printf '%s' "$f" | sed 's/[][*?\\]/\\&/g')
+            gh release upload "$TAG" "$esc" --clobber
+          done
+          {
+            gh release list --limit 200 --json tagName,createdAt \
+              --jq 'sort_by(.createdAt) | reverse | .[].tagName' 2>/dev/null \
+              | grep '^pl-' | tail -n +26 \
+              | while read -r old; do gh release delete "$old" --yes --cleanup-tag 2>/dev/null || true; done
+          } || true
+
+      - name: Upload artifact (fallback)
+        uses: actions/upload-artifact@v4
+        with:
+          name: pl-${{ inputs.request_id }}
+          path: out/
+          retention-days: 3
+          if-no-files-found: error
+          compression-level: 0
