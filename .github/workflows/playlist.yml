@@ -233,37 +233,41 @@ jobs:
           " > batch.tsv
 
           run_ytdlp() {
-            local tmpl="$1"; shift
-            yt-dlp \
-              $FMT_ARGS $PROXY_ARGS "$@" \
-              --no-playlist --no-progress --newline \
-              --retries 5 --fragment-retries 10 \
-              --embed-metadata \
-              --remote-components ejs:github \
-              --ffmpeg-location "$FFMPEG_BIN" \
-              -o "$tmpl" \
-              -- "$URL"
-          }
-
-          IMP="generic:impersonate"
-          ALT="youtube:player_client=default,tv,web_safari,mweb,tv_embedded"
-          TOTAL=$(grep -c . batch.tsv)
-          N=0
-          while IFS=$'\t' read -r URL IDX; do
-            [ -z "$URL" ] && continue
-            N=$((N+1))
-            echo "::group::track $IDX ($N of $TOTAL): $URL"
-            TMPL="out/${IDX} - %(title).100B [%(id)s].%(ext)s"
-            if   run_ytdlp "$TMPL" $COOKIE_ARGS --extractor-args "$IMP"; then :
-            elif run_ytdlp "$TMPL" $COOKIE_ARGS --extractor-args "$ALT"; then :
-            elif run_ytdlp "$TMPL" $COOKIE_ARGS --impersonate chrome; then :
-            elif run_ytdlp "$TMPL" --extractor-args "$IMP" --extractor-args "$ALT"; then :
-            else
-              echo "::warning::failed to download $URL"
-            fi
-            echo "::endgroup::"
-          done < batch.tsv
-          rm -f batch.tsv cookies.txt
+                      local tmpl="$1"; shift
+                      yt-dlp \
+                        $FMT_ARGS $PROXY_ARGS "$@" \
+                        --no-playlist --no-progress --newline \
+                        --retries 5 --fragment-retries 10 \
+                        --embed-metadata \
+                        --remote-components ejs:github \
+                        --ffmpeg-location "$FFMPEG_BIN" \
+                        -o "$tmpl" \
+                        -- "$URL"
+                    }
+          
+                    IMP="generic:impersonate"
+                    CLI_IOS="youtube:player_client=ios,android"
+                    CLI_MWEB="youtube:player_client=mweb,web"
+          
+                    TOTAL=$(grep -c . batch.tsv)
+                    N=0
+                    while IFS=$'\t' read -r URL IDX; do
+                      [ -z "$URL" ] && continue
+                      N=$((N+1))
+                      echo "::group::track $IDX ($N of $TOTAL): $URL"
+                      TMPL="out/${IDX} - %(title).100B [%(id)s].%(ext)s"
+                      if   run_ytdlp "$TMPL" $COOKIE_ARGS --extractor-args "$IMP"; then :
+                      elif run_ytdlp "$TMPL" $COOKIE_ARGS --extractor-args "$CLI_IOS"; then :
+                      elif run_ytdlp "$TMPL" $COOKIE_ARGS --extractor-args "$CLI_MWEB"; then :
+                      elif run_ytdlp "$TMPL" $COOKIE_ARGS --impersonate chrome; then :
+                      elif run_ytdlp "$TMPL" --extractor-args "$CLI_IOS"; then :
+                      elif run_ytdlp "$TMPL" --extractor-args "$CLI_MWEB"; then :
+                      else
+                        echo "::warning::failed to download $URL"
+                      fi
+                      echo "::endgroup::"
+                    done < batch.tsv
+                    rm -f batch.tsv cookies.txt
 
       - name: Always drop cookies
         if: always()
