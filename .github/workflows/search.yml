@@ -1,0 +1,139 @@
+name: YouTube Search Proxy
+
+on:
+  workflow_dispatch:
+    inputs:
+      query:
+        description: 'מילת חיפוש'
+        required: true
+        type: string
+      search_id:
+        description: 'מזהה חיפוש ייחודי'
+        required: true
+        type: string
+      max_results:
+        description: 'כמות תוצאות מקסימלית'
+        required: false
+        default: '15'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  search:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install yt-dlp
+        run: |
+          python -m pip install --upgrade pip
+          pip install yt-dlp
+
+      - name: Execute Search & Process Thumbnails
+        env:
+          QUERY: ${{ inputs.query }}
+          SEARCH_ID: ${{ inputs.search_id }}
+          MAX_RESULTS: ${{ inputs.max_results }}
+        run: |
+          cat << 'EOF' > search_script.py
+          import json
+          import subprocess
+          import sys
+          import base64
+          import urllib.request
+          import os
+
+          query = os.environ.get("QUERY", "")
+          search_id = os.environ.get("SEARCH_ID", "")
+          max_results = os.environ.get("MAX_RESULTS", "15")
+
+          cmd = [
+              "yt-dlp",
+              f"ytsearch{max_results}:{query}",
+              "--dump-json",
+              "--flat-playlist",
+              "--no-warnings"
+          ]
+
+          proc = subprocess.run(cmd, capture_output=True, text=True)
+          results = []
+
+          for line in proc.stdout.strip().split("\n"):
+              if not line:
+                  continue
+              try:
+                  data = json.loads(line)
+                  video_id = data.get("id")
+                  title = data.get("title")
+                  duration = data.get("duration")
+                  channel = data.get("uploader") or data.get("channel") or "לא ידוע"
+
+                  # פורמט זמן תצוגה
+                  dur_str = "—"
+                  if duration:
+                      m, s = divmod(int(duration), 60)
+                      h, m = divmod(m, 60)
+                      dur_str = f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+                  # המרת תמונה ל-Base64 כדי לעקוף חסימת תמונות בנטפרי
+                  thumb_b64 = ""
+                  thumbs = data.get("thumbnails", [])
+                  thumb_url = thumbs[0].get("url") if thumbs else f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+                  
+                  if thumb_url:
+                      try:
+                          req = urllib.request.Request(thumb_url, headers={'User-Agent': 'Mozilla/5.0'})
+                          with urllib.request.urlopen(req, timeout=4) as resp:
+                              img_bytes = resp.read()
+                              thumb_b64 = "data:image/jpeg;base64," + base64.b64encode(img_bytes).decode('utf-8')
+                      except Exception:
+                          thumb_b64 = ""
+
+                  results.append({
+                      "id": video_id,
+                      "title": title,
+                      "channel": channel,
+                      "duration": dur_str,
+                      "url": f"https://www.youtube.com/watch?v={video_id}",
+                      "thumbnail": thumb_b64
+                  })
+              except Exception:
+                  continue
+
+          output_payload = {
+              "search_id": search_id,
+              "query": query,
+              "count": len(results),
+              "results": results
+          }
+
+          with open("results.json", "w", encoding="utf-8") as f:
+              json.dump(output_payload, f, ensure_ascii=False, indent=2)
+          EOF
+
+          python search_script.py
+
+      - name: Publish Search Results Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SEARCH_ID: ${{ inputs.search_id }}
+          QUERY: ${{ inputs.query }}
+        run: |
+          gh release create "search-${SEARCH_ID}" results.json \
+            --title "Search: ${QUERY}" \
+            --notes "Search results for: ${QUERY}"
+
+      - name: Cleanup Old Search Releases (Keep repo clean)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # מוחק שחרורי חיפוש ישנים שמתחילים ב-search- מעבר ל-10 האחרונים
+          gh release list --limit 50 | grep "search-" | tail -n +11 | awk '{print $1}' | while read -r tag; do
+            gh release delete "$tag" --yes || true
+          done
