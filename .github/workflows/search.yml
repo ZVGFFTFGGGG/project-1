@@ -20,6 +20,9 @@ jobs:
   search:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -53,7 +56,6 @@ jobs:
           proc = subprocess.run(cmd, capture_output=True, text=True)
           
           markdown_lines = [f"# תוצאות חיפוש עבור: {query}\n"]
-          results_list = []
 
           for i, line in enumerate(proc.stdout.strip().split("\n"), 1):
               if not line:
@@ -86,16 +88,18 @@ jobs:
       - name: Publish Release with Results
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           QUERY: ${{ inputs.query }}
         run: |
           TAG="search-$(date +%s)"
-          gh release create "$TAG" --title "חיפוש: ${QUERY}" --notes-file notes.md
+          gh release create "$TAG" --title "חיפוש: ${QUERY}" --notes-file notes.md --target main
 
       - name: Cleanup Old Search Releases
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
           gh release list --limit 50 | grep "search-" | tail -n +6 | awk '{print $1}' | while read -r tag; do
-            gh release delete "$tag" --yes || true
+            gh release delete "$tag" --yes --cleanup-tag || true
           done
