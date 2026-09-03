@@ -7,10 +7,6 @@ on:
         description: 'מילת חיפוש'
         required: true
         type: string
-      search_id:
-        description: 'מזהה חיפוש ייחודי'
-        required: true
-        type: string
       max_results:
         description: 'כמות תוצאות מקסימלית'
         required: false
@@ -31,25 +27,19 @@ jobs:
 
       - name: Install yt-dlp
         run: |
-          python -m pip install --upgrade pip
           pip install yt-dlp
 
-      - name: Execute Search & Process Thumbnails
+      - name: Execute Search
         env:
           QUERY: ${{ inputs.query }}
-          SEARCH_ID: ${{ inputs.search_id }}
           MAX_RESULTS: ${{ inputs.max_results }}
         run: |
           cat << 'EOF' > search_script.py
           import json
           import subprocess
-          import sys
-          import base64
-          import urllib.request
           import os
 
           query = os.environ.get("QUERY", "")
-          search_id = os.environ.get("SEARCH_ID", "")
           max_results = os.environ.get("MAX_RESULTS", "15")
 
           cmd = [
@@ -61,9 +51,11 @@ jobs:
           ]
 
           proc = subprocess.run(cmd, capture_output=True, text=True)
-          results = []
+          
+          markdown_lines = [f"# תוצאות חיפוש עבור: {query}\n"]
+          results_list = []
 
-          for line in proc.stdout.strip().split("\n"):
+          for i, line in enumerate(proc.stdout.strip().split("\n"), 1):
               if not line:
                   continue
               try:
@@ -71,69 +63,39 @@ jobs:
                   video_id = data.get("id")
                   title = data.get("title")
                   duration = data.get("duration")
-                  channel = data.get("uploader") or data.get("channel") or "לא ידוע"
+                  channel = data.get("uploader") or data.get("channel") or "ערוץ לא ידוע"
+                  url = f"https://www.youtube.com/watch?v={video_id}"
 
-                  # פורמט זמן תצוגה
-                  dur_str = "—"
+                  dur_str = ""
                   if duration:
                       m, s = divmod(int(duration), 60)
                       h, m = divmod(m, 60)
-                      dur_str = f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+                      dur_str = f" [{h}:{m:02d}:{s:02d}]" if h else f" [{m:02d}:{s:02d}]"
 
-                  # המרת תמונה ל-Base64 כדי לעקוף חסימת תמונות בנטפרי
-                  thumb_b64 = ""
-                  thumbs = data.get("thumbnails", [])
-                  thumb_url = thumbs[0].get("url") if thumbs else f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
-                  
-                  if thumb_url:
-                      try:
-                          req = urllib.request.Request(thumb_url, headers={'User-Agent': 'Mozilla/5.0'})
-                          with urllib.request.urlopen(req, timeout=4) as resp:
-                              img_bytes = resp.read()
-                              thumb_b64 = "data:image/jpeg;base64," + base64.b64encode(img_bytes).decode('utf-8')
-                      except Exception:
-                          thumb_b64 = ""
-
-                  results.append({
-                      "id": video_id,
-                      "title": title,
-                      "channel": channel,
-                      "duration": dur_str,
-                      "url": f"https://www.youtube.com/watch?v={video_id}",
-                      "thumbnail": thumb_b64
-                  })
+                  markdown_lines.append(f"{i}. **{title}**{dur_str} - *{channel}*")
+                  markdown_lines.append(f"   קישור: `{url}`\n")
               except Exception:
                   continue
 
-          output_payload = {
-              "search_id": search_id,
-              "query": query,
-              "count": len(results),
-              "results": results
-          }
-
-          with open("results.json", "w", encoding="utf-8") as f:
-              json.dump(output_payload, f, ensure_ascii=False, indent=2)
+          with open("notes.md", "w", encoding="utf-8") as f:
+              f.write("\n".join(markdown_lines))
           EOF
 
           python search_script.py
 
-      - name: Publish Search Results Release
+      - name: Publish Release with Results
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SEARCH_ID: ${{ inputs.search_id }}
           QUERY: ${{ inputs.query }}
         run: |
-          gh release create "search-${SEARCH_ID}" results.json \
-            --title "Search: ${QUERY}" \
-            --notes "Search results for: ${QUERY}"
+          TAG="search-$(date +%s)"
+          gh release create "$TAG" --title "חיפוש: ${QUERY}" --notes-file notes.md
 
-      - name: Cleanup Old Search Releases (Keep repo clean)
+      - name: Cleanup Old Search Releases
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # מוחק שחרורי חיפוש ישנים שמתחילים ב-search- מעבר ל-10 האחרונים
-          gh release list --limit 50 | grep "search-" | tail -n +11 | awk '{print $1}' | while read -r tag; do
+          gh release list --limit 50 | grep "search-" | tail -n +6 | awk '{print $1}' | while read -r tag; do
             gh release delete "$tag" --yes || true
           done
