@@ -2,11 +2,10 @@ name: Scheduled Drive Queue Downloader
 
 on:
   schedule:
-    # מופעל אוטומטית כל 25 דקות, 24/7, בענן של גיטהאב
+    # בדיקה אוטומטית כל 25 דקות בענן
     - cron: '*/25 * * * *'
-  workflow_dispatch: # מאפשר גם הפעלה ידנית מגיטהאב כשיש גישה
+  workflow_dispatch:
 
-# מונע ריצות כפולות במקביל אם הורדה אחת לקחה יותר מ-25 דקות
 concurrency:
   group: drive-queue-sync
   cancel-in-progress: false
@@ -36,34 +35,34 @@ jobs:
           python -m pip install --upgrade pip
           pip install --upgrade yt-dlp cryptography
 
-      - name: Configure Rclone
+      - name: Configure Rclone (OAuth2 User)
         env:
-          GDRIVE_SA_KEY: ${{ secrets.GDRIVE_SA_KEY }}
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
           mkdir -p ~/.config/rclone
-          echo "$GDRIVE_SA_KEY" > /tmp/sa_key.json
-
           cat <<EOF > ~/.config/rclone/rclone.conf
           [gdrive]
           type = drive
+          client_id = $GDRIVE_CLIENT_ID
+          client_secret = $GDRIVE_CLIENT_SECRET
           scope = drive
-          service_account_file = /tmp/sa_key.json
+          token = {"refresh_token":"$GDRIVE_REFRESH_TOKEN","token_type":"Bearer"}
           root_folder_id = $GDRIVE_FOLDER_ID
           EOF
 
       - name: Check for Pending Requests in Google Drive
         id: check_queue
         run: |
-          # בדיקה האם קיימים קבצים בתיקיית To-Download (כולל ייצוא אוטומטי של Google Docs ל-txt)
           FILES=$(rclone lsf "gdrive:To-Download" --drive-export-formats txt 2>/dev/null || true)
-          
           if [ -z "$FILES" ]; then
             echo "has_tasks=false" >> $GITHUB_OUTPUT
-            echo "תיקיית To-Download ריקה. אין משימות לביצוע."
+            echo "תיקיית To-Download ריקה."
           else
             echo "has_tasks=true" >> $GITHUB_OUTPUT
-            echo "נמצאו בקשות בתיקייה:"
+            echo "נמצאו משימות בתור:"
             echo "$FILES"
           fi
 
@@ -101,18 +100,17 @@ jobs:
         run: |
           mkdir -p ./local_queue downloads
 
-          # העתקת הבקשות מקומית תוך המרת Google Docs לקובצי טקסט רגילים
+          # הורדת קובצי הבקשה (המרת Google Docs ל-txt אוטומטית)
           rclone copy "gdrive:To-Download" ./local_queue --drive-export-formats txt
 
-          # העברת עותק לתיקיית Archive בדרייב ומחיקה מ-To-Download
-          rclone copy "gdrive:To-Download" "gdrive:Archive"
+          # מחיקת הבקשות מתיקיית התור בדרייב
           rclone delete "gdrive:To-Download"
 
-          # חילוץ כל קישורי היוטיוב מתוך כל הקבצים שירדו
+          # חילוץ קישורי יוטיוב
           URLS=$(grep -shoE 'https?://(www\.)?(youtube\.com|youtu\.be)/[^\s"'\''<>]+' ./local_queue/* 2>/dev/null | sort -u || true)
 
           if [ -z "$URLS" ]; then
-            echo "לא נמצאו קישורי יוטיוב תקינים בתוך הקבצים."
+            echo "לא נמצאו קישורי יוטיוב תקינים."
             exit 0
           fi
 
@@ -121,26 +119,22 @@ jobs:
             COOKIE_ARG="--cookies cookies.txt"
           fi
 
-          # עיבוד והורדת כל קישור ברשימה
           while IFS= read -r URL; do
             [ -z "$URL" ] && continue
-            echo "=========================================="
             echo "מתחיל להוריד: $URL"
-            echo "=========================================="
             
-            # הורדה והעלאה ישירה ל-Completed (מחיקה מיידית מהדיסק של השרת)
             yt-dlp \
               $COOKIE_ARG \
               --js-engine deno \
               -f "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4] / bv*+ba/b" \
               --merge-output-format mp4 \
               -o "downloads/%(title)s [%(id)s].%(ext)s" \
-              --exec "rclone move {} gdrive:Completed/ --drive-chunk-size 64M -v && echo 'הועלה ונמחק מהדיסק: {}'" \
+              --exec "rclone move {} gdrive:Completed/ --drive-chunk-size 64M -v && echo 'הועלה בהצלחה: {}'" \
               "$URL"
           done <<< "$URLS"
 
       - name: Cleanup Sensitive Data
         if: always()
         run: |
-          rm -f cookies.txt /tmp/sa_key.json
+          rm -f cookies.txt
           rm -rf ~/.config/rclone downloads local_queue
