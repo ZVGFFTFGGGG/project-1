@@ -71,12 +71,20 @@ jobs:
           EOF
 
       - name: Scan and Download
+        env:
+          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
         run: |
           mkdir -p ./local_queue downloads
 
-          echo "=== קבצים שנמצאו בדרייב כרגע ==="
+          echo "=== בדיקת קבצים בדרייב ==="
           rclone ls "gdrive:" || true
-          echo "================================"
+
+          # שמירת העוגיות מתוך ה-Secret לקובץ זמני
+          if [ -n "$YOUTUBE_COOKIES" ]; then
+            echo "$YOUTUBE_COOKIES" > /tmp/cookies.txt
+            COOKIE_ARG="--cookies /tmp/cookies.txt"
+            echo "עוגיות נטענו בהצלחה!"
+          fi
 
           # הורדת קובצי הבקשות
           rclone copy "gdrive:" ./local_queue --drive-export-formats txt --max-depth 2
@@ -117,19 +125,21 @@ jobs:
           echo "קישורים שנמצאו לעיבוד:"
           cat urls_to_download.txt
 
-          # מחיקת קובצי הבקשה מהדרייב כדי שלא יירדו שוב
+          # מחיקת קובצי הבקשה מהדרייב
           rclone delete "gdrive:To-Download" 2>/dev/null || true
           rclone delete "gdrive:" --include "*.docx" --include "*.txt" 2>/dev/null || true
 
-          # הורדה ללא עוגיות באמצעות עקיפת iOS והעלאה לדרייב
+          # הורדה והעלאה לדרייב
           while IFS= read -r URL; do
             [ -z "$URL" ] && continue
             echo "מוריד כעת: $URL"
             yt-dlp \
-              --extractor-args "youtube:player_client=ios,web_safari" \
+              $COOKIE_ARG \
               -f "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4] / bv*+ba/b" \
               --merge-output-format mp4 \
               -o "downloads/%(title)s [%(id)s].%(ext)s" \
               --exec "rclone move {} gdrive:Completed/ --drive-chunk-size 64M -v && echo 'הועלה בהצלחה: {}'" \
               "$URL"
           done < urls_to_download.txt
+
+          rm -f /tmp/cookies.txt
