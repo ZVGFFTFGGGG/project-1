@@ -139,12 +139,12 @@ jobs:
           rclone delete "gdrive:" --include "*.docx" --include "*.txt" 2>/dev/null || true
 
           # הורדה והעלאה ישירה ל-Completed
+          # הורדה והעלאה ישירה ל-Completed
           while IFS= read -r URL; do
             [ -z "$URL" ] && continue
             echo "מוריד כעת: $URL"
             yt-dlp \
               $COOKIE_ARG \
-              --js-engine deno \
               -f "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4] / bv*+ba/b" \
               --merge-output-format mp4 \
               -o "downloads/%(title)s [%(id)s].%(ext)s" \
