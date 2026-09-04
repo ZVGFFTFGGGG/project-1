@@ -1,0 +1,137 @@
+name: download-part-19
+run-name: download-part-19-with-cookies
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  download-part19:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache || true
+          df -h /
+
+      - name: Set up Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Install yt-dlp + ffmpeg
+        run: |
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet --upgrade yt-dlp cryptography imageio-ffmpeg curl_cffi
+          if command -v zip >/dev/null 2>&1; then :; else sudo apt-get update -qq && sudo apt-get install -y -qq zip; fi
+          FFMPEG_BIN=$(python -c "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())")
+          chmod +x "$FFMPEG_BIN"
+          echo "FFMPEG_BIN=$FFMPEG_BIN" >> "$GITHUB_ENV"
+
+      - name: Load Cookies from Secret
+        env:
+          COOKIES_DATA: ${{ secrets.YOUTUBE_COOKIES }}
+        run: |
+          if [ -z "$COOKIES_DATA" ]; then
+            echo "::error::Secret YOUTUBE_COOKIES is missing or empty!"
+            exit 1
+          fi
+          printf '%s\n' "$COOKIES_DATA" > cookies.txt
+          echo "cookies.txt created successfully ($(wc -l < cookies.txt) lines)."
+
+      - name: Download all 26 videos of part 19
+        env:
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+        run: |
+          mkdir -p out
+
+          URLS=(
+            "https://www.youtube.com/shorts/T3lkJZS8VyU"
+            "https://www.youtube.com/shorts/ImqPWc7Zr-A"
+            "https://www.youtube.com/shorts/y-WC5VehWvU"
+            "https://www.youtube.com/shorts/Yd9cnDpDNq0"
+            "https://www.youtube.com/shorts/ilaBba6Xsyg"
+            "https://www.youtube.com/shorts/jUGwFGxif6Q"
+            "https://www.youtube.com/shorts/-PyVyLLPhbY"
+            "https://www.youtube.com/shorts/yQB7RAiURqs"
+            "https://www.youtube.com/shorts/S6AgR8Um5cQ"
+            "https://www.youtube.com/shorts/-CPcnCp___U"
+            "https://www.youtube.com/shorts/wIuyVTAHtAE"
+            "https://www.youtube.com/shorts/y6lVYla8-3Q"
+            "https://www.youtube.com/shorts/Nf2AXM9qoEg"
+            "https://www.youtube.com/shorts/UvmTlW-CSgY"
+            "https://www.youtube.com/shorts/TzxUyPoMa-0"
+            "https://www.youtube.com/shorts/MuXmkkBMeLw"
+            "https://www.youtube.com/shorts/gMxCsk-HtU8"
+            "https://www.youtube.com/shorts/e7oSYRHoMrk"
+            "https://www.youtube.com/shorts/nNK84mlJvNM"
+            "https://www.youtube.com/shorts/eyg-QjjjUsM"
+            "https://www.youtube.com/shorts/st9WLycbqnQ"
+            "https://www.youtube.com/shorts/ugRRo_BR6ac"
+            "https://www.youtube.com/shorts/sUqgDuIGfyw"
+            "https://www.youtube.com/watch?v=xhr-dBaGzgk"
+            "https://www.youtube.com/watch?v=SK8M6fk5dPY"
+            "https://www.youtube.com/watch?v=Q-Iy02ksWaA"
+          )
+
+          TOTAL=${#URLS[@]}
+          COUNT=0
+
+          for URL in "${URLS[@]}"; do
+            COUNT=$((COUNT + 1))
+            echo "::group::Downloading ($COUNT of $TOTAL): $URL"
+            yt-dlp \
+              -f "bv*+ba/b" --merge-output-format mp4 \
+              --cookies cookies.txt \
+              --no-playlist --no-progress --newline \
+              --retries 5 --fragment-retries 10 \
+              --embed-metadata \
+              --remote-components ejs:github \
+              --ffmpeg-location "$FFMPEG_BIN" \
+              -o "out/%(title).100B [%(id)s].%(ext)s" \
+              -- "$URL" || echo "::warning::Failed to download $URL"
+            echo "::endgroup::"
+          done
+
+          rm -f cookies.txt
+          ls -lh out/
+
+      - name: Always drop cookies
+        if: always()
+        run: rm -f cookies.txt
+
+      - name: Package and Upload to Release (Split under 1.8GB)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: dl-cute-tings-part19
+        run: |
+          if [ -z "$(ls -A out 2>/dev/null)" ]; then
+            echo "::error::No files were downloaded"
+            exit 1
+          fi
+          mkdir -p pack
+
+          echo "Creating ZIP archives (max 1800MB each)..."
+          (cd out && zip -r -0 -q -s 1800m "../pack/Cute_Tings_part19.zip" .)
+
+          echo "Files created:"
+          ls -lh pack/
+
+          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" --title "Cute Tings - Part 19 Completed" --notes "Automated download of part 19"
+
+          find pack -type f -print0 | while IFS= read -r -d '' f; do
+            esc=$(printf '%s' "$f" | sed 's/[][*?\\]/\\&/g')
+            for attempt in 1 2 3 4 5; do
+              echo "Uploading $f (attempt $attempt)..."
+              if gh release upload "$TAG" "$esc" --clobber; then
+                echo "Uploaded $f successfully!"
+                break
+              fi
+              sleep 5
+            done
+          done
