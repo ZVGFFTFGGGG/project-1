@@ -503,21 +503,58 @@ jobs:
             exit 0
           fi
           mkdir -p pack
-          BASE="${COLLECTION_NAME:-collection}"
-          PART_NUM=$(printf "%02d" $((BATCH_INDEX + 1)))
-          ZIP_NAME="${BASE}_part${PART_NUM}.zip"
-          
-          (cd out && zip -r -0 -q "../pack/${ZIP_NAME}" .)
-          
-          esc=$(printf '%s' "pack/${ZIP_NAME}" | sed 's/[][*?\\]/\\&/g')
-          
-          for attempt in 1 2 3 4 5; do
-            echo "Uploading $ZIP_NAME to release $TAG (attempt $attempt)..."
-            if gh release upload "$TAG" "$esc" --clobber; then
-              echo "Uploaded $ZIP_NAME successfully!"
-              break
-            fi
-            sleep 5
+
+          python - <<'PY'
+          import os, sys, zipfile
+
+          base_name = """${COLLECTION_NAME:-collection}""".strip()
+          part_num = f"{int(os.environ.get('BATCH_INDEX', 0)) + 1:02d}"
+          out_dir = "out"
+          pack_dir = "pack"
+          MAX_SIZE = int(1.8 * 1024 * 1024 * 1024) # 1.8 GB limit
+
+          all_files = []
+          for root, _, files in os.walk(out_dir):
+              for f in files:
+                  full = os.path.join(root, f)
+                  rel = os.path.relpath(full, out_dir)
+                  all_files.append((full, rel, os.path.getsize(full)))
+
+          total_size = sum(f[2] for f in all_files)
+
+          if total_size <= MAX_SIZE:
+              zip_path = os.path.join(pack_dir, f"{base_name}_part{part_num}.zip")
+              with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_STORED) as zf:
+                  for full, rel, _ in all_files:
+                      zf.write(full, rel)
+          else:
+              sub = 1
+              cur_size = 0
+              zf = None
+              for full, rel, sz in all_files:
+                  if zf is None or (cur_size + sz > MAX_SIZE and cur_size > 0):
+                      if zf:
+                          zf.close()
+                      zip_path = os.path.join(pack_dir, f"{base_name}_part{part_num}_{sub}.zip")
+                      zf = zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_STORED)
+                      sub += 1
+                      cur_size = 0
+                  zf.write(full, rel)
+                  cur_size += sz
+              if zf:
+                  zf.close()
+          PY
+
+          find pack -name "*.zip" -type f -print0 | while IFS= read -r -d '' f; do
+            esc=$(printf '%s' "$f" | sed 's/[][*?\\]/\\&/g')
+            for attempt in 1 2 3 4 5; do
+              echo "Uploading $f to release $TAG (attempt $attempt)..."
+              if gh release upload "$TAG" "$esc" --clobber; then
+                echo "Uploaded $f successfully!"
+                break
+              fi
+              sleep 5
+            done
           done
 
   # --------------------------------------------------- collection: finish up
