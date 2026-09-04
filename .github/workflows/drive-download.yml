@@ -71,8 +71,6 @@ jobs:
           EOF
 
       - name: Scan and Download
-        env:
-          COOKIE_KEY: ${{ secrets.COOKIE_KEY }}
         run: |
           mkdir -p ./local_queue downloads
 
@@ -119,45 +117,16 @@ jobs:
           echo "קישורים שנמצאו לעיבוד:"
           cat urls_to_download.txt
 
-          # פענוח העוגיות באמצעות COOKIE_KEY
-          echo "=== מפענח עוגיות ==="
-          python - << 'EOF'
-          import os, base64
-          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
-          key_str = os.environ.get("COOKIE_KEY", "").strip()
-          if not key_str:
-              print("שגיאה: COOKIE_KEY לא מוגדר!")
-              exit(1)
-
-          try:
-              key = bytes.fromhex(key_str)
-          except ValueError:
-              key = base64.b64decode(key_str)
-
-          with open("cookies.enc", "rb") as f:
-              data = f.read()
-
-          nonce, ciphertext = data[:12], data[12:]
-          decrypted = AESGCM(key).decrypt(nonce, ciphertext, None)
-          with open("cookies.txt", "wb") as f:
-              f.write(decrypted)
-          print("העוגיות פוענחו בהצלחה ונוצר cookies.txt!")
-          EOF
-
-          COOKIE_ARG=""
-          [ -f "cookies.txt" ] && COOKIE_ARG="--cookies cookies.txt"
-
-          # מחיקת קובצי הבקשה כדי שלא יירדו שוב
+          # מחיקת קובצי הבקשה מהדרייב כדי שלא יירדו שוב
           rclone delete "gdrive:To-Download" 2>/dev/null || true
           rclone delete "gdrive:" --include "*.docx" --include "*.txt" 2>/dev/null || true
 
-          # הורדה עם עוגיות והעלאה ישירה ל-Completed
+          # הורדה ללא עוגיות באמצעות עקיפת iOS והעלאה לדרייב
           while IFS= read -r URL; do
             [ -z "$URL" ] && continue
             echo "מוריד כעת: $URL"
             yt-dlp \
-              $COOKIE_ARG \
+              --extractor-args "youtube:player_client=ios,web_safari" \
               -f "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4] / bv*+ba/b" \
               --merge-output-format mp4 \
               -o "downloads/%(title)s [%(id)s].%(ext)s" \
