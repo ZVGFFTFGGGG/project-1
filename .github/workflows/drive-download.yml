@@ -71,6 +71,8 @@ jobs:
           EOF
 
       - name: Scan and Download
+        env:
+          COOKIE_KEY: ${{ secrets.COOKIE_KEY }}
         run: |
           mkdir -p ./local_queue downloads
 
@@ -78,10 +80,10 @@ jobs:
           rclone ls "gdrive:" || true
           echo "================================"
 
-          # הורדת כל הקבצים מקומית (כולל המרת Google Docs)
+          # הורדת קובצי הבקשות
           rclone copy "gdrive:" ./local_queue --drive-export-formats txt --max-depth 2
 
-          # חילוץ קישורים חכם שתומך גם ב-TXT וגם ב-DOCX (וורד)
+          # חילוץ הקישורים
           python - << 'EOF'
           import os, re, zipfile
 
@@ -110,26 +112,38 @@ jobs:
           EOF
 
           if [ ! -s "urls_to_download.txt" ]; then
-            echo "לא נמצא שום קישור יוטיוב בקבצים. ודא שיש קובץ עם קישור בתיקייה."
+            echo "לא נמצא שום קישור יוטיוב בקבצים."
             exit 0
           fi
 
           echo "קישורים שנמצאו לעיבוד:"
           cat urls_to_download.txt
 
-          # פענוח עוגיות
-          if [ -f "cookies.enc" ] && [ -n "${{ secrets.COOKIE_KEY }}" ]; then
-            python - << 'EOF'
+          # פענוח העוגיות באמצעות COOKIE_KEY
+          echo "=== מפענח עוגיות ==="
+          python - << 'EOF'
           import os, base64
           from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
           key_str = os.environ.get("COOKIE_KEY", "").strip()
-          try: key = bytes.fromhex(key_str)
-          except ValueError: key = base64.b64decode(key_str)
-          with open("cookies.enc", "rb") as f: data = f.read()
-          decrypted = AESGCM(key).decrypt(data[:12], data[12:], None)
-          with open("cookies.txt", "wb") as f: f.write(decrypted)
+          if not key_str:
+              print("שגיאה: COOKIE_KEY לא מוגדר!")
+              exit(1)
+
+          try:
+              key = bytes.fromhex(key_str)
+          except ValueError:
+              key = base64.b64decode(key_str)
+
+          with open("cookies.enc", "rb") as f:
+              data = f.read()
+
+          nonce, ciphertext = data[:12], data[12:]
+          decrypted = AESGCM(key).decrypt(nonce, ciphertext, None)
+          with open("cookies.txt", "wb") as f:
+              f.write(decrypted)
+          print("העוגיות פוענחו בהצלחה ונוצר cookies.txt!")
           EOF
-          fi
 
           COOKIE_ARG=""
           [ -f "cookies.txt" ] && COOKIE_ARG="--cookies cookies.txt"
@@ -138,8 +152,7 @@ jobs:
           rclone delete "gdrive:To-Download" 2>/dev/null || true
           rclone delete "gdrive:" --include "*.docx" --include "*.txt" 2>/dev/null || true
 
-          # הורדה והעלאה ישירה ל-Completed
-          # הורדה והעלאה ישירה ל-Completed
+          # הורדה עם עוגיות והעלאה ישירה ל-Completed
           while IFS= read -r URL; do
             [ -z "$URL" ] && continue
             echo "מוריד כעת: $URL"
