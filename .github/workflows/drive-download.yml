@@ -10,101 +10,85 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  diagnose-and-download:
+  run-download:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python & Deno
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: Set up Deno (n-challenge solver)
-        uses: denoland/setup-deno@v2
+      - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
 
       - name: Install Tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg rclone
+          sudo apt-get install -y ffmpeg rclone jq
           python -m pip install --upgrade pip
           pip install --upgrade yt-dlp cryptography
 
-      - name: Configure Rclone
+      - name: Authenticate and Configure Rclone
         env:
           GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
           GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
           GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
+          # משיכת access_token חי מגוגל ישירות דרך ה-API
+          TOKEN_RES=$(curl -s -X POST https://oauth2.googleapis.com/token \
+            -d "client_id=$GDRIVE_CLIENT_ID" \
+            -d "client_secret=$GDRIVE_CLIENT_SECRET" \
+            -d "refresh_token=$GDRIVE_REFRESH_TOKEN" \
+            -d "grant_type=refresh_token")
+
+          ACCESS_TOKEN=$(echo "$TOKEN_RES" | jq -r '.access_token // empty')
+
+          if [ -z "$ACCESS_TOKEN" ]; then
+            echo "שגיאת אימות מול גוגל:"
+            echo "$TOKEN_RES"
+            exit 1
+          fi
+
+          echo "האימות עבר בהצלחה!"
           mkdir -p ~/.config/rclone
+
+          # יצירת קובץ הגדרות מושלם ש-rclone מקבל
+          TOKEN_JSON="{\"access_token\":\"$ACCESS_TOKEN\",\"token_type\":\"Bearer\",\"refresh_token\":\"$GDRIVE_REFRESH_TOKEN\",\"expiry\":\"2035-01-01T00:00:00Z\"}"
+
           cat <<EOF > ~/.config/rclone/rclone.conf
           [gdrive]
           type = drive
           client_id = $GDRIVE_CLIENT_ID
           client_secret = $GDRIVE_CLIENT_SECRET
           scope = drive
-          token = {"refresh_token":"$GDRIVE_REFRESH_TOKEN","token_type":"Bearer"}
+          token = $TOKEN_JSON
           root_folder_id = $GDRIVE_FOLDER_ID
-
-          [entire_drive]
-          type = drive
-          client_id = $GDRIVE_CLIENT_ID
-          client_secret = $GDRIVE_CLIENT_SECRET
-          scope = drive
-          token = {"refresh_token":"$GDRIVE_REFRESH_TOKEN","token_type":"Bearer"}
           EOF
 
-      - name: Full Google Drive Diagnostic
-        run: |
-          echo "=================================================="
-          echo "           דוח בדיקת מצב GOOGLE DRIVE            "
-          echo "=================================================="
-          
-          echo "1. בדיקת תקשורת ואימות מול גוגל:"
-          if rclone about entire_drive: 2>&1 | tee /tmp/quota.txt; then
-            echo "-> החיבור לחשבון גוגל תקין ומאושר!"
-          else
-            echo "-> שגיאה: החיבור לגוגל נכשל. בדוק את ה-Secrets."
-            exit 1
-          fi
-          
-          echo ""
-          echo "2. מה קיים בתוך ה-GDRIVE_FOLDER_ID שהגדרת:"
-          echo "--- תיקיות משנה ---"
-          rclone lsd gdrive: || echo "אין תיקיות משנה או שגיאה בגישה"
-          echo "--- קבצים ---"
-          rclone lsf gdrive: --drive-export-formats txt || echo "אין קבצים"
-          
-          echo ""
-          echo "3. סריקה בתוך To-Download (אם קיימת):"
-          rclone lsf "gdrive:To-Download" --drive-export-formats txt 2>/dev/null || echo "התיקייה To-Download לא נמצאה תחת ה-ID הזה"
-          echo "=================================================="
-
-      - name: Scan For Links and Download
+      - name: Scan and Download
         run: |
           mkdir -p ./local_queue downloads
 
-          # סריקה כפולה: מוריד קבצים גם מהתיקייה הראשית וגם מ-To-Download
-          rclone copy "gdrive:" ./local_queue --drive-export-formats txt --max-depth 2 --include "*.txt" --include "*.docx" 2>/dev/null || true
-          rclone copy "gdrive:To-Download" ./local_queue --drive-export-formats txt 2>/dev/null || true
+          # סריקת כל הקבצים שבתיקייה הראשית ובתיקיות המשנה
+          rclone copy "gdrive:" ./local_queue --drive-export-formats txt --max-depth 2 2>/dev/null || true
 
-          # חילוץ כל קישורי היוטיוב מכל הקבצים שנמצאו
+          # חילוץ קישורי יוטיוב
           URLS=$(grep -shoE 'https?://(www\.)?(youtube\.com|youtu\.be)/[^\s"'\''<>]+' ./local_queue/* 2>/dev/null | sort -u || true)
 
           if [ -z "$URLS" ]; then
-            echo "לא נמצא שום קישור יוטיוב באף קובץ. ממתין לסבב הבא."
+            echo "לא נמצאו קישורי יוטיוב להורדה. מסתיים בהצלחה."
             exit 0
           fi
 
-          echo "נמצאו קישורים להורדה:"
+          echo "נמצאו קישורים:"
           echo "$URLS"
 
-          # פענוח עוגיות במידה וקיימות
+          # פענוח עוגיות
           if [ -f "cookies.enc" ] && [ -n "${{ secrets.COOKIE_KEY }}" ]; then
             python - << 'EOF'
           import os, base64
@@ -127,13 +111,13 @@ jobs:
           COOKIE_ARG=""
           [ -f "cookies.txt" ] && COOKIE_ARG="--cookies cookies.txt"
 
-          # מחיקת קובצי הבקשה כדי שלא יירדו שוב
+          # מחיקת קובצי הבקשה כדי שלא יורדו שוב
           rclone delete "gdrive:To-Download" 2>/dev/null || true
 
           # הורדה והעלאה ישירה ל-Completed
           while IFS= read -r URL; do
             [ -z "$URL" ] && continue
-            echo "מוריד כעת: $URL"
+            echo "מוריד: $URL"
             yt-dlp \
               $COOKIE_ARG \
               --js-engine deno \
@@ -146,6 +130,4 @@ jobs:
 
       - name: Cleanup
         if: always()
-        run: |
-          rm -f cookies.txt
-          rm -rf ~/.config/rclone downloads local_queue
+        run: rm -rf cookies.txt ~/.config/rclone downloads local_queue
