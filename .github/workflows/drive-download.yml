@@ -130,16 +130,16 @@ jobs:
           rclone delete "gdrive:" --include "*.docx" --include "*.txt" 2>/dev/null || true
 
           # הורדה והעלאה לדרייב
-          while IFS= read -r URL; do
-            [ -z "$URL" ] && continue
-            echo "מוריד כעת: $URL"
-            yt-dlp \
-              $COOKIE_ARG \
-              -f "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4] / bv*+ba/b" \
-              --merge-output-format mp4 \
-              -o "downloads/%(title)s [%(id)s].%(ext)s" \
-              --exec "rclone move {} gdrive:Completed/ --drive-chunk-size 64M -v && echo 'הועלה בהצלחה: {}'" \
-              "$URL"
-          done < urls_to_download.txt
-
-          rm -f /tmp/cookies.txt
+          # הורדה והעלאה ישירה ל-Completed
+                    while IFS= read -r URL; do
+                      [ -z "$URL" ] && continue
+                      echo "מוריד כעת: $URL"
+                      yt-dlp \
+                        $COOKIE_ARG \
+                        --remote-components ejs:github \
+                        -f "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4] / bv*+ba/b" \
+                        --merge-output-format mp4 \
+                        -o "downloads/%(title)s [%(id)s].%(ext)s" \
+                        --exec "rclone move {} gdrive:Completed/ --drive-chunk-size 64M -v && echo 'הועלה בהצלחה: {}'" \
+                        "$URL"
+                    done < urls_to_download.txt
