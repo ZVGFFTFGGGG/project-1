@@ -2,7 +2,6 @@ name: Scheduled Drive Queue Downloader
 
 on:
   schedule:
-    # בדיקה אוטומטית כל 25 דקות בענן
     - cron: '*/25 * * * *'
   workflow_dispatch:
 
@@ -11,7 +10,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  check-and-download:
+  diagnose-and-download:
     runs-on: ubuntu-latest
 
     steps:
@@ -35,7 +34,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install --upgrade yt-dlp cryptography
 
-      - name: Configure Rclone (OAuth2 User)
+      - name: Configure Rclone
         env:
           GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
           GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
@@ -51,78 +50,90 @@ jobs:
           scope = drive
           token = {"refresh_token":"$GDRIVE_REFRESH_TOKEN","token_type":"Bearer"}
           root_folder_id = $GDRIVE_FOLDER_ID
+
+          [entire_drive]
+          type = drive
+          client_id = $GDRIVE_CLIENT_ID
+          client_secret = $GDRIVE_CLIENT_SECRET
+          scope = drive
+          token = {"refresh_token":"$GDRIVE_REFRESH_TOKEN","token_type":"Bearer"}
           EOF
 
-      - name: Check for Pending Requests in Google Drive
-        id: check_queue
+      - name: Full Google Drive Diagnostic
         run: |
-          FILES=$(rclone lsf "gdrive:To-Download" --drive-export-formats txt 2>/dev/null || true)
-          if [ -z "$FILES" ]; then
-            echo "has_tasks=false" >> $GITHUB_OUTPUT
-            echo "תיקיית To-Download ריקה."
+          echo "=================================================="
+          echo "           דוח בדיקת מצב GOOGLE DRIVE            "
+          echo "=================================================="
+          
+          echo "1. בדיקת תקשורת ואימות מול גוגל:"
+          if rclone about entire_drive: 2>&1 | tee /tmp/quota.txt; then
+            echo "-> החיבור לחשבון גוגל תקין ומאושר!"
           else
-            echo "has_tasks=true" >> $GITHUB_OUTPUT
-            echo "נמצאו משימות בתור:"
-            echo "$FILES"
+            echo "-> שגיאה: החיבור לגוגל נכשל. בדוק את ה-Secrets."
+            exit 1
+          fi
+          
+          echo ""
+          echo "2. מה קיים בתוך ה-GDRIVE_FOLDER_ID שהגדרת:"
+          echo "--- תיקיות משנה ---"
+          rclone lsd gdrive: || echo "אין תיקיות משנה או שגיאה בגישה"
+          echo "--- קבצים ---"
+          rclone lsf gdrive: --drive-export-formats txt || echo "אין קבצים"
+          
+          echo ""
+          echo "3. סריקה בתוך To-Download (אם קיימת):"
+          rclone lsf "gdrive:To-Download" --drive-export-formats txt 2>/dev/null || echo "התיקייה To-Download לא נמצאה תחת ה-ID הזה"
+          echo "=================================================="
+
+      - name: Scan For Links and Download
+        run: |
+          mkdir -p ./local_queue downloads
+
+          # סריקה כפולה: מוריד קבצים גם מהתיקייה הראשית וגם מ-To-Download
+          rclone copy "gdrive:" ./local_queue --drive-export-formats txt --max-depth 2 --include "*.txt" --include "*.docx" 2>/dev/null || true
+          rclone copy "gdrive:To-Download" ./local_queue --drive-export-formats txt 2>/dev/null || true
+
+          # חילוץ כל קישורי היוטיוב מכל הקבצים שנמצאו
+          URLS=$(grep -shoE 'https?://(www\.)?(youtube\.com|youtu\.be)/[^\s"'\''<>]+' ./local_queue/* 2>/dev/null | sort -u || true)
+
+          if [ -z "$URLS" ]; then
+            echo "לא נמצא שום קישור יוטיוב באף קובץ. ממתין לסבב הבא."
+            exit 0
           fi
 
-      - name: Decrypt Cookies (AES-256-GCM)
-        if: steps.check_queue.outputs.has_tasks == 'true'
-        env:
-          COOKIE_KEY: ${{ secrets.COOKIE_KEY }}
-        run: |
-          if [ -f "cookies.enc" ] && [ -n "$COOKIE_KEY" ]; then
+          echo "נמצאו קישורים להורדה:"
+          echo "$URLS"
+
+          # פענוח עוגיות במידה וקיימות
+          if [ -f "cookies.enc" ] && [ -n "${{ secrets.COOKIE_KEY }}" ]; then
             python - << 'EOF'
           import os, base64
           from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
           key_str = os.environ.get("COOKIE_KEY", "").strip()
           try:
               key = bytes.fromhex(key_str)
           except ValueError:
               key = base64.b64decode(key_str)
-
           with open("cookies.enc", "rb") as f:
               data = f.read()
-
           nonce, ciphertext = data[:12], data[12:]
           aesgcm = AESGCM(key)
           decrypted = aesgcm.decrypt(nonce, ciphertext, None)
-
           with open("cookies.txt", "wb") as f:
               f.write(decrypted)
-          print("Cookies decrypted successfully.")
           EOF
           fi
 
-      - name: Process Queue and Download
-        if: steps.check_queue.outputs.has_tasks == 'true'
-        run: |
-          mkdir -p ./local_queue downloads
-
-          # הורדת קובצי הבקשה (המרת Google Docs ל-txt אוטומטית)
-          rclone copy "gdrive:To-Download" ./local_queue --drive-export-formats txt
-
-          # מחיקת הבקשות מתיקיית התור בדרייב
-          rclone delete "gdrive:To-Download"
-
-          # חילוץ קישורי יוטיוב
-          URLS=$(grep -shoE 'https?://(www\.)?(youtube\.com|youtu\.be)/[^\s"'\''<>]+' ./local_queue/* 2>/dev/null | sort -u || true)
-
-          if [ -z "$URLS" ]; then
-            echo "לא נמצאו קישורי יוטיוב תקינים."
-            exit 0
-          fi
-
           COOKIE_ARG=""
-          if [ -f "cookies.txt" ]; then
-            COOKIE_ARG="--cookies cookies.txt"
-          fi
+          [ -f "cookies.txt" ] && COOKIE_ARG="--cookies cookies.txt"
 
+          # מחיקת קובצי הבקשה כדי שלא יירדו שוב
+          rclone delete "gdrive:To-Download" 2>/dev/null || true
+
+          # הורדה והעלאה ישירה ל-Completed
           while IFS= read -r URL; do
             [ -z "$URL" ] && continue
-            echo "מתחיל להוריד: $URL"
-            
+            echo "מוריד כעת: $URL"
             yt-dlp \
               $COOKIE_ARG \
               --js-engine deno \
@@ -133,7 +144,7 @@ jobs:
               "$URL"
           done <<< "$URLS"
 
-      - name: Cleanup Sensitive Data
+      - name: Cleanup
         if: always()
         run: |
           rm -f cookies.txt
