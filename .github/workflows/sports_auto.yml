@@ -7,16 +7,16 @@ on:
       mode:
         description: 'Operation Mode'
         required: true
-        default: 'search'
+        default: 'latest'
         type: choice
         options:
-          - 'search'
-          - 'latest'
-          - 'direct'
+          - 'latest'         # מושך את העדכונים האחרונים שעלו
+          - 'search'         # חיפוש חופשי
+          - 'direct'         # הדבקת קישור ישיר
       query:
         description: 'Target query or URL'
         required: false
-        default: 'Barcelona'
+        default: 'ברצלונה'
         type: string
       count:
         description: 'Item count'
@@ -70,95 +70,86 @@ jobs:
           COUNT: ${{ inputs.count }}
         run: |
           python - <<'PY'
-          import urllib.request, urllib.parse, re, os, sys
-          from bs4 import BeautifulSoup
+          import urllib.request, xml.etree.ElementTree as ET, os, sys
 
-          mode = os.environ.get("MODE", "search")
+          mode = os.environ.get("MODE", "latest")
           query = os.environ.get("QUERY", "").strip()
           count = int(os.environ.get("COUNT", "3"))
 
-          targets = []
-          headers = {
-              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          # מיפוי שמות באנגלית לעברית למקרה שהמשתמש מקליד באנגלית
+          alias_map = {
+              "barcelona": "ברצלונה",
+              "real madrid": "ריאל מדריד",
+              "real": "ריאל",
+              "maccabi": "מכבי",
+              "haifa": "חיפה",
+              "tel aviv": "תל אביב",
+              "arsenal": "ארסנל",
+              "chelsea": "צ'לסי",
+              "liverpool": "ליברפול",
+              "champions": "אלופות"
           }
+
+          q_low = query.lower()
+          search_terms = [query.lower()]
+          if q_low in alias_map:
+              search_terms.append(alias_map[q_low])
+
+          targets = []
 
           if mode == "direct":
               if query.startswith("http"):
                   targets.append(query)
 
-          elif mode == "search":
-              print(f"Searching index for: {query}")
-              # Strategy 1: Search engine HTML extraction
-              try:
-                  q_enc = urllib.parse.quote(f"site:sport5.co.il OR site:one.co.il {query}")
-                  search_url = f"https://html.duckduckgo.com/html/?q={q_enc}"
-                  req = urllib.request.Request(search_url, headers=headers)
-                  with urllib.request.urlopen(req, timeout=15) as resp:
-                      soup = BeautifulSoup(resp.read(), "html.parser")
-                      for a in soup.find_all("a", href=True):
-                          href = a["href"]
-                          if "uddg=" in href:
-                              m = re.search(r"uddg=([^&]+)", href)
-                              if m:
-                                  actual = urllib.parse.unquote(m.group(1))
-                                  if ("sport5.co.il/articles.aspx" in actual or "one.co.il/Article" in actual):
-                                      if actual not in targets:
-                                          targets.append(actual)
-                                          if len(targets) >= count:
-                                              break
-              except Exception as e:
-                  print(f"Search index error: {e}")
+          else:
+              # רשימת ערוצי ה-RSS הרשמיים של Sport5 ו-ONE
+              rss_feeds = [
+                  "https://www.sport5.co.il/Rss/RssArticles.aspx",
+                  "https://www.sport5.co.il/Rss/RssVideo.aspx",
+                  "https://www.one.co.il/cat/coop/xml/rss/newsfeed.aspx"
+              ]
 
-              # Strategy 2: Direct site scanning fallback
-              if len(targets) < count:
-                  for site in ["https://www.sport5.co.il/", "https://www.one.co.il/"]:
-                      try:
-                          req = urllib.request.Request(site, headers=headers)
-                          with urllib.request.urlopen(req, timeout=15) as resp:
-                              soup = BeautifulSoup(resp.read(), "html.parser")
-                              for a in soup.find_all("a", href=True):
-                                  h = a["href"]
-                                  t = (a.get_text() or "").strip()
-                                  full_link = ""
-                                  if "articles.aspx" in h and "docID=" in h:
-                                      full_link = h if h.startswith("http") else f"https://www.sport5.co.il/{h.lstrip('/')}"
-                                  elif "/Article/" in h:
-                                      full_link = h if h.startswith("http") else f"https://www.one.co.il/{h.lstrip('/')}"
+              headers = {
+                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)"
+              }
 
-                                  if full_link and full_link not in targets:
-                                      if query.lower() in t.lower() or query.lower() in h.lower():
-                                          targets.append(full_link)
-                                          if len(targets) >= count:
-                                              break
-                      except Exception as e:
-                          print(f"Direct scan error: {e}")
+              print(f"Scanning official feeds. Query: '{query}', Mode: '{mode}'")
 
-          elif mode == "latest":
-              print("Fetching latest media links...")
-              for site in ["https://www.sport5.co.il/", "https://www.one.co.il/"]:
+              for feed_url in rss_feeds:
                   try:
-                      req = urllib.request.Request(site, headers=headers)
+                      req = urllib.request.Request(feed_url, headers=headers)
                       with urllib.request.urlopen(req, timeout=15) as resp:
-                          soup = BeautifulSoup(resp.read(), "html.parser")
-                          for a in soup.find_all("a", href=True):
-                              h = a["href"]
-                              full_link = ""
-                              if "articles.aspx" in h and "docID=" in h:
-                                  full_link = h if h.startswith("http") else f"https://www.sport5.co.il/{h.lstrip('/')}"
-                              elif "/Article/" in h:
-                                  full_link = h if h.startswith("http") else f"https://www.one.co.il/{h.lstrip('/')}"
+                          xml_data = resp.read()
+                          root = ET.fromstring(xml_data)
+                          for item in root.findall(".//item"):
+                              title = (item.find("title").text if item.find("title") is not None else "").strip()
+                              link = (item.find("link").text if item.find("link") is not None else "").strip()
 
-                              if full_link and full_link not in targets:
-                                  targets.append(full_link)
+                              if not link or link in targets:
+                                  continue
+
+                              # במצב חיפוש - מחפש התאמה
+                              if mode == "search":
+                                  matched = any(term in title.lower() or term in link.lower() for term in search_terms)
+                                  if matched:
+                                      targets.append(link)
+                                      if len(targets) >= count:
+                                          break
+                              # במצב latest - לוקח את העדכונים האחרונים
+                              elif mode == "latest":
+                                  targets.append(link)
                                   if len(targets) >= count:
                                       break
                   except Exception as e:
-                      print(f"Latest fetch error: {e}")
+                      print(f"Feed error ({feed_url}): {e}")
+
+                  if len(targets) >= count:
+                      break
 
           clean_targets = targets[:count]
           with open("targets.txt", "w", encoding="utf-8") as f:
-              for url in clean_targets:
-                  f.write(url.strip() + "\n")
+              for u in clean_targets:
+                  f.write(u.strip() + "\n")
 
           print(f"Total resolved targets: {len(clean_targets)}")
           for u in clean_targets:
