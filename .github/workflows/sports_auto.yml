@@ -70,13 +70,12 @@ jobs:
           COUNT: ${{ inputs.count }}
         run: |
           python - <<'PY'
-          import urllib.request, re, os, sys
+          import urllib.request, re, os, sys, html
 
           mode = os.environ.get("MODE", "search")
           raw_query = os.environ.get("QUERY", "").strip()
           count = int(os.environ.get("COUNT", "3"))
 
-          # Unicode-safe mapping (keeps the YAML file 100% clean of raw Hebrew characters)
           aliases = {
               "barcelona": ["barcelona", "\u05d1\u05e8\u05e6\u05dc\u05d5\u05e0\u05d4", "\u05d1\u05d0\u05e8\u05e1\u05d4"],
               "real madrid": ["real madrid", "\u05e8\u05d9\u05d0\u05dc \u05de\u05d3\u05e8\u05d9\u05d3", "\u05e8\u05d9\u05d0\u05dc"],
@@ -104,8 +103,7 @@ jobs:
           else:
               feed_sources = [
                   "https://www.sport5.co.il/sitemap/articles/news-sitemap.xml",
-                  "https://www.sport5.co.il/sitemap/games/news-sitemap.xml",
-                  "https://www.ynet.co.il/Integration/StoryRss3.xml"
+                  "https://www.sport5.co.il/sitemap/games/news-sitemap.xml"
               ]
 
               headers = {
@@ -125,16 +123,9 @@ jobs:
                               loc_m = re.search(r'<loc>(.*?)</loc>', block)
                               title_m = re.search(r'<news:title>(.*?)</news:title>', block) or re.search(r'<title>(.*?)</title>', block)
                               if loc_m:
-                                  loc = loc_m.group(1).strip()
-                                  title = title_m.group(1).strip() if title_m else ""
-                                  candidate_pool.append((loc, title))
-
-                          for block in re.findall(r'<item>(.*?)</item>', content, re.DOTALL):
-                              loc_m = re.search(r'<link>(.*?)</link>', block)
-                              title_m = re.search(r'<title>(.*?)</title>', block)
-                              if loc_m:
-                                  loc = loc_m.group(1).strip()
-                                  title = title_m.group(1).strip() if title_m else ""
+                                  # Unescape HTML entities like &amp; to &
+                                  loc = html.unescape(loc_m.group(1).strip())
+                                  title = html.unescape(title_m.group(1).strip()) if title_m else ""
                                   candidate_pool.append((loc, title))
 
                   except Exception as e:
@@ -154,30 +145,29 @@ jobs:
                       has_query = any(k in t_low or k in l_low for k in search_keys)
                       if has_query:
                           targets.append(loc)
-                          if len(targets) >= count * 3:
+                          if len(targets) >= count * 5: # Pool enough candidates
                               break
 
                   elif mode == "latest":
                       has_media = any(hint in t_low for hint in media_hints)
                       if has_media:
                           targets.append(loc)
-                          if len(targets) >= count * 3:
+                          if len(targets) >= count * 5:
                               break
 
               if not targets and candidate_pool:
                   for loc, _ in candidate_pool:
                       if loc not in targets:
                           targets.append(loc)
-                          if len(targets) >= count:
+                          if len(targets) >= count * 3:
                               break
 
-          clean_targets = targets[:max(count, 1)]
           with open("targets.txt", "w", encoding="utf-8") as f:
-              for u in clean_targets:
+              for u in targets:
                   f.write(u.strip() + "\n")
 
-          print(f"Total resolved targets: {len(clean_targets)}")
-          for u in clean_targets:
+          print(f"Total resolved targets: {len(targets)}")
+          for u in targets[:10]:
               print(f"-> {u}")
           PY
           sed -i 's/\r//g' targets.txt
@@ -206,6 +196,7 @@ jobs:
             if yt-dlp \
               $FMT_ARGS \
               --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+              --referer "https://www.sport5.co.il/" \
               --no-playlist --no-progress --newline \
               --retries 3 --fragment-retries 5 \
               --embed-metadata \
@@ -213,12 +204,13 @@ jobs:
               -o "out/%(title).100B [%(id)s].%(ext)s" \
               -- "$URL"; then
               downloaded=$((downloaded + 1))
+              echo "Successfully downloaded $downloaded / $max_items"
               if [ "$downloaded" -ge "$max_items" ]; then
                 echo "Target count reached ($downloaded items)."
                 break
               fi
             else
-              echo "Item has no direct media, continuing to next candidate..."
+              echo "Item has no video or skipped, trying next..."
             fi
           done < targets.txt
 
