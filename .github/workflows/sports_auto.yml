@@ -53,95 +53,120 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache || true
 
-      - name: Set up Environment & Tools
+      - name: Set up Deno (Bypass YouTube Bot Check)
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Set up Python & Tools
         run: |
           python -m pip install --quiet --upgrade pip
           python -m pip install --quiet --upgrade yt-dlp imageio-ffmpeg curl_cffi
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg
+          if command -v ffmpeg >/dev/null 2>&1; then
+            FFMPEG_BIN=$(command -v ffmpeg)
+          else
+            FFMPEG_BIN=$(python -c "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())")
+            chmod +x "$FFMPEG_BIN"
+          fi
+          echo "FFMPEG_BIN=$FFMPEG_BIN" >> "$GITHUB_ENV"
 
-      - name: Find and Download Matches
+      - name: Resolve Video URLs
+        id: resolve
         env:
           MODE: ${{ inputs.mode }}
           QUERY: ${{ inputs.query }}
           COUNT: ${{ inputs.count }}
+        run: |
+          python - <<'PY'
+          import subprocess, os, sys
+
+          mode = os.environ.get("MODE", "search")
+          query = os.environ.get("QUERY", "").strip()
+          count = os.environ.get("COUNT", "3").strip()
+
+          urls = []
+
+          def get_flat_urls(target, limit):
+              cmd = [
+                  "yt-dlp",
+                  "--flat-playlist",
+                  "--print", "url",
+                  "--playlist-end", str(limit),
+                  target
+              ]
+              try:
+                  res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                  lines = [line.strip() for line in res.stdout.strip().split("\n") if line.strip()]
+                  return lines[:limit]
+              except Exception as e:
+                  print(f"Error fetching {target}: {e}")
+                  return []
+
+          if mode == "search":
+              search_term = f"ytsearch{count}:תקציר {query}"
+              print(f"מחפש: {search_term}")
+              urls = get_flat_urls(search_term, int(count))
+
+          elif mode == "latest_sport5":
+              urls = get_flat_urls("https://www.youtube.com/@SPORT5_IL/videos", int(count))
+
+          elif mode == "latest_one":
+              urls = get_flat_urls("https://www.youtube.com/@one-1004/videos", int(count))
+
+          elif mode == "latest_all":
+              half = max(1, int(count) // 2)
+              urls.extend(get_flat_urls("https://www.youtube.com/@SPORT5_IL/videos", half))
+              urls.extend(get_flat_urls("https://www.youtube.com/@one-1004/videos", half))
+
+          elif mode == "direct_url":
+              if query:
+                  urls = [query]
+
+          with open("targets.txt", "w", encoding="utf-8") as f:
+              for u in urls:
+                  f.write(u + "\n")
+
+          print(f"נמצאו {len(urls)} סרטונים להורדה.")
+          PY
+
+      - name: Download Videos (With Full TV/JS Bypass)
+        env:
           QUALITY: ${{ inputs.quality }}
         run: |
           mkdir -p out
 
           case "$QUALITY" in
-            1080) FMT="-f bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b --merge-output-format mp4" ;;
-            720)  FMT="-f bv*[height<=720]+ba/b[height<=720]/bv*+ba/b --merge-output-format mp4" ;;
-            480)  FMT="-f bv*[height<=480]+ba/b[height<=480]/bv*+ba/b --merge-output-format mp4" ;;
-            *)    FMT="-f bv*+ba/b --merge-output-format mp4" ;;
+            1080) FMT_ARGS="-f bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b --merge-output-format mp4" ;;
+            720)  FMT_ARGS="-f bv*[height<=720]+ba/b[height<=720]/bv*+ba/b --merge-output-format mp4" ;;
+            480)  FMT_ARGS="-f bv*[height<=480]+ba/b[height<=480]/bv*+ba/b --merge-output-format mp4" ;;
+            *)    FMT_ARGS="-f bv*+ba/b --merge-output-format mp4" ;;
           esac
 
-          python - <<PY
-          import subprocess, os, sys
+          IMP="generic:impersonate"
+          ALT="youtube:player_client=tv,mweb,web_safari,default"
 
-          mode = os.environ.get("MODE", "search")
-          query = os.environ.get("QUERY", "").strip()
-          count = int(os.environ.get("COUNT", "3"))
-          fmt = os.environ.get("FMT", "")
+          run_ytdlp() {
+            yt-dlp \
+              $FMT_ARGS "$@" \
+              --no-playlist --no-progress --newline \
+              --retries 5 --fragment-retries 10 \
+              --embed-metadata \
+              --remote-components ejs:github \
+              --ffmpeg-location "$FFMPEG_BIN" \
+              -o "out/%(title).100B [%(id)s].%(ext)s" \
+              -- "$URL"
+          }
 
-          commands = []
-
-          if mode == "search":
-              print(f"=== מחפש ביוטיוב תקצירים עבור: {query} ===")
-              # חיפוש ממוקד שמביא את התקצירים הרשמיים בעברית
-              search_term = f"ytsearch{count}:תקציר {query}"
-              commands.append([
-                  "yt-dlp", *fmt.split(),
-                  "--no-playlist",
-                  "-o", "out/%(title).100B [%(id)s].%(ext)s",
-                  "--embed-metadata",
-                  search_term
-              ])
-
-          elif mode == "latest_sport5":
-              print(f"=== מוריד {count} תקצירים אחרונים מספורט 5 ===")
-              commands.append([
-                  "yt-dlp", *fmt.split(),
-                  "--playlist-end", str(count),
-                  "-o", "out/%(title).100B [%(id)s].%(ext)s",
-                  "--embed-metadata",
-                  "https://www.youtube.com/@SPORT5_IL/videos"
-              ])
-
-          elif mode == "latest_one":
-              print(f"=== מוריד {count} תקצירים אחרונים מ-ONE ===")
-              commands.append([
-                  "yt-dlp", *fmt.split(),
-                  "--playlist-end", str(count),
-                  "-o", "out/%(title).100B [%(id)s].%(ext)s",
-                  "--embed-metadata",
-                  "https://www.youtube.com/@one-1004/videos"
-              ])
-
-          elif mode == "latest_all":
-              half = max(1, count // 2)
-              print(f"=== מוריד {half} מספורט 5 ו-{half} מ-ONE ===")
-              commands.append([
-                  "yt-dlp", *fmt.split(),
-                  "--playlist-end", str(half),
-                  "-o", "out/%(title).100B [%(id)s].%(ext)s",
-                  "--embed-metadata",
-                  "https://www.youtube.com/@SPORT5_IL/videos"
-              ])
-              commands.append([
-                  "yt-dlp", *fmt.split(),
-                  "--playlist-end", str(half),
-                  "-o", "out/%(title).100B [%(id)s].%(ext)s",
-                  "--embed-metadata",
-                  "https://www.youtube.com/@one-1004/videos"
-              ])
-
-          for cmd in commands:
-              try:
-                  subprocess.run(cmd, check=True)
-              except Exception as e:
-                  print(f"שגיאה בהורדה: {e}")
-          PY
+          while IFS= read -r URL; do
+            [ -z "$URL" ] && continue
+            echo "--- מוריד: $URL ---"
+            if   run_ytdlp --extractor-args "$IMP" --extractor-args "$ALT"; then :
+            elif run_ytdlp --extractor-args "$ALT"; then :
+            elif run_ytdlp --impersonate chrome; then :
+            else
+              echo "::error::הורדת הסרטון נכשלה: $URL"
+            fi
+          done < targets.txt
 
       - name: Package to Netfree Safe ZIPs (max 1.8GB)
         run: |
@@ -158,7 +183,6 @@ jobs:
           pack_dir = "pack"
           MAX_SIZE = int(1.8 * 1024 * 1024 * 1024)
 
-          # פיצול קבצים מעל 1.8GB אם קיימים
           for root, _, fnames in os.walk(out_dir):
               for f in fnames:
                   full = os.path.join(root, f)
@@ -189,7 +213,6 @@ jobs:
                   all_files.append((full, rel, os.path.getsize(full)))
           all_files.sort(key=lambda x: x[1])
 
-          # בניית ZIP
           base_name = "Sports_Highlights"
           total_sz = sum(f[2] for f in all_files)
           if total_sz <= MAX_SIZE:
