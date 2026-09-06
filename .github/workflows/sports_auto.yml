@@ -10,13 +10,13 @@ on:
         default: 'search'
         type: choice
         options:
-          - 'search'         # חיפוש חופשי לפי שם קבוצה/משחק
-          - 'latest_all'     # התקצירים האחרונים מכל הערוצים (ספורט 5 + ONE)
-          - 'latest_sport5'  # התקצירים האחרונים מערוץ הספורט בלבד
-          - 'latest_one'     # התקצירים האחרונים מ-ONE בלבד (ספרדית/איטלקית)
-          - 'direct_url'     # הדבקת קישור ישיר (אם יש לך)
+          - 'search'         # חיפוש חופשי (ברצלונה, ריאל מדריד וכו')
+          - 'latest_all'     # התקצירים האחרונים מכל הערוצים
+          - 'latest_sport5'  # תקצירים מערוץ הספורט
+          - 'latest_one'     # תקצירים מ-ONE
+          - 'direct_url'     # קישור ישיר (מיוטיוב, ספורט 5 או צרלטון)
       query:
-        description: 'חיפוש חופשי (למשל: "ברצלונה", "ריאל מדריד", "ארסנל", "מכבי חיפה")'
+        description: 'שם קבוצה / קישור (למשל: ברצלונה)'
         required: false
         default: 'ברצלונה'
         type: string
@@ -81,44 +81,39 @@ jobs:
           raw_data = os.environ.get("YOUTUBE_COOKIES", "").strip()
           cookie_key = os.environ.get("COOKIE_KEY", "").strip()
 
-          if not raw_data:
-              print("::error::לא נמצא Secret בשם YOUTUBE_COOKIES!")
-              sys.exit(1)
-
-          # 1. בדיקה אם העוגיות בטקסט רגיל (Netscape)
-          if "youtube.com" in raw_data or "# Netscape" in raw_data:
-              with open("cookies.txt", "w", encoding="utf-8") as f:
-                  f.write(raw_data)
-              print("נטענו עוגיות טקסט ישירות בהצלחה!")
-              sys.exit(0)
-
-          # 2. בדיקה אם זה Base64 (טקסט מקודד או מוצפן ב-AES-GCM)
-          try:
-              blob = base64.b64decode(raw_data)
-              try:
-                  decoded = blob.decode('utf-8')
-                  if "youtube.com" in decoded or "# Netscape" in decoded:
-                      with open("cookies.txt", "w", encoding="utf-8") as f:
-                          f.write(decoded)
-                      print("נטענו עוגיות Base64 בהצלחה!")
-                      sys.exit(0)
-              except Exception:
-                  pass
-
-              # 3. פענוח עם COOKIE_KEY (AES-GCM)
-              if cookie_key:
-                  from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-                  key = bytes.fromhex(cookie_key)
-                  iv, ct = blob[:12], blob[12:]
-                  data = AESGCM(key).decrypt(iv, ct, None)
-                  with open("cookies.txt", "wb") as f:
-                      f.write(data)
-                  print("פוענחו עוגיות מ-YOUTUBE_COOKIES באמצעות COOKIE_KEY בהצלחה!")
+          if raw_data:
+              # 1. טקסט עוגיות רגיל
+              if "youtube.com" in raw_data or "# Netscape" in raw_data:
+                  with open("cookies.txt", "w", encoding="utf-8") as f:
+                      f.write(raw_data)
+                  print("נטענו עוגיות Netscape בהצלחה!")
                   sys.exit(0)
-          except Exception as e:
-              print(f"ניסיון פענוח נכשל: {e}, כותב כטקסט ישיר...")
-              with open("cookies.txt", "w", encoding="utf-8") as f:
-                  f.write(raw_data)
+
+              # 2. פענוח Base64 / AES-GCM
+              try:
+                  blob = base64.b64decode(raw_data)
+                  try:
+                      decoded = blob.decode('utf-8')
+                      if "youtube.com" in decoded or "# Netscape" in decoded:
+                          with open("cookies.txt", "w", encoding="utf-8") as f:
+                              f.write(decoded)
+                          print("נטענו עוגיות Base64!")
+                          sys.exit(0)
+                  except Exception:
+                      pass
+
+                  if cookie_key:
+                      from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+                      key = bytes.fromhex(cookie_key)
+                      iv, ct = blob[:12], blob[12:]
+                      data = AESGCM(key).decrypt(iv, ct, None)
+                      with open("cookies.txt", "wb") as f:
+                          f.write(data)
+                      print("פוענחו עוגיות באמצעות COOKIE_KEY בהצלחה!")
+                      sys.exit(0)
+              except Exception as e:
+                  with open("cookies.txt", "w", encoding="utf-8") as f:
+                      f.write(raw_data)
           PY
 
       - name: Resolve Video URLs
@@ -128,7 +123,7 @@ jobs:
           COUNT: ${{ inputs.count }}
         run: |
           python - <<'PY'
-          import subprocess, os, sys
+          import subprocess, os, sys, re
 
           mode = os.environ.get("MODE", "search")
           query = os.environ.get("QUERY", "").strip()
@@ -136,7 +131,7 @@ jobs:
 
           urls = []
 
-          def get_flat_urls(target, limit):
+          def get_clean_ids(target, limit):
               cmd = [
                   "yt-dlp",
                   "--flat-playlist",
@@ -149,38 +144,44 @@ jobs:
 
               try:
                   res = subprocess.run(cmd, capture_output=True, text=True, check=True)
-                  lines = [line.replace('\r', '').replace('\n', '').strip() for line in res.stdout.splitlines() if line.strip()]
-                  clean_urls = [f"https://www.youtube.com/watch?v={l}" if not l.startswith("http") else l for l in lines]
-                  return clean_urls[:limit]
+                  out = []
+                  for line in res.stdout.splitlines():
+                      line = line.strip()
+                      match = re.search(r'([a-zA-Z0-9_-]{11})', line)
+                      if match:
+                          out.append(f"https://www.youtube.com/watch?v={match.group(1)}")
+                  return out[:limit]
               except Exception as e:
-                  print(f"Error fetching {target}: {e}")
+                  print(f"Error: {e}")
                   return []
 
           if mode == "search":
               search_term = f"ytsearch{count}:תקציר {query}"
-              print(f"מחפש ביוטיוב: {search_term}")
-              urls = get_flat_urls(search_term, count)
+              print(f"מחפש: {search_term}")
+              urls = get_clean_ids(search_term, count)
 
           elif mode == "latest_sport5":
-              urls = get_flat_urls("https://www.youtube.com/@SPORT5_IL/videos", count)
+              urls = get_clean_ids("https://www.youtube.com/@SPORT5_IL/videos", count)
 
           elif mode == "latest_one":
-              urls = get_flat_urls("https://www.youtube.com/@one-1004/videos", count)
+              urls = get_clean_ids("https://www.youtube.com/@one-1004/videos", count)
 
           elif mode == "latest_all":
               half = max(1, count // 2)
-              urls.extend(get_flat_urls("https://www.youtube.com/@SPORT5_IL/videos", half))
-              urls.extend(get_flat_urls("https://www.youtube.com/@one-1004/videos", half))
+              urls.extend(get_clean_ids("https://www.youtube.com/@SPORT5_IL/videos", half))
+              urls.extend(get_clean_ids("https://www.youtube.com/@one-1004/videos", half))
 
           elif mode == "direct_url":
               if query:
-                  urls = [query]
+                  urls = [query.strip()]
 
           with open("targets.txt", "w", encoding="utf-8") as f:
               for u in urls:
                   f.write(u + "\n")
 
-          print(f"נמצאו {len(urls)} סרטונים להורדה.")
+          print(f"נמצאו {len(urls)} סרטונים להורדה:")
+          for u in urls:
+              print(f"- {u}")
           PY
 
       - name: Download Videos
