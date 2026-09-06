@@ -70,14 +70,13 @@ jobs:
           COUNT: ${{ inputs.count }}
         run: |
           python - <<'PY'
-          import urllib.request, re, os, sys, html
+          import urllib.request, urllib.parse, re, os, sys, html
           from bs4 import BeautifulSoup
 
           mode = os.environ.get("MODE", "search")
           raw_query = os.environ.get("QUERY", "").strip()
           count = int(os.environ.get("COUNT", "3"))
 
-          # Unicode-safe mapping (keeps the YAML file 100% clean of raw Hebrew characters)
           aliases = {
               "barcelona": ["barcelona", "\u05d1\u05e8\u05e6\u05dc\u05d5\u05e0\u05d4", "\u05d1\u05d0\u05e8\u05e1\u05d4"],
               "real madrid": ["real madrid", "\u05e8\u05d9\u05d0\u05dc \u05de\u05d3\u05e8\u05d9\u05d3", "\u05e8\u05d9\u05d0\u05dc"],
@@ -102,46 +101,53 @@ jobs:
 
           targets = []
 
-          def extract_media_stream(page_url):
-              """Inspect article HTML to find embedded video streams directly"""
+          def extract_clean_stream(page_url):
+              """Extract pure m3u8 stream from article HTML"""
               try:
                   req = urllib.request.Request(page_url, headers=headers)
                   with urllib.request.urlopen(req, timeout=10) as r:
                       page_html = r.read().decode("utf-8", errors="ignore")
 
-                      # 1. Look for direct m3u8 playlist streams
-                      m3u8_matches = re.findall(r'(https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*)', page_html)
-                      for stream in m3u8_matches:
-                          if "master" in stream or "index" in stream or "manifest" in stream or "hls" in stream:
-                              return stream
+                      # Case 1: watch.sport5.co.il?src=
+                      match_watch = re.search(r'watch\.sport5\.co\.il\?src=([^"\'<>\s]+)', page_html)
+                      if match_watch:
+                          raw_src = match_watch.group(1)
+                          # Split on delimiters like ___ or &
+                          clean_src = raw_src.split("___")[0].split("\\u0026")[0].split("&")[0]
+                          clean_src = urllib.parse.unquote(clean_src).strip()
+                          if ".m3u8" in clean_src:
+                              idx = clean_src.find(".m3u8")
+                              return clean_src[:idx + 5]
 
-                      # 2. Look for Kaltura / Sport5 video player IDs
-                      kaltura_match = re.search(r'entry_id["\':\s=]+([a-zA-Z0-9_-]{10,})', page_html) or \
-                                      re.search(r'mediaID["\':\s=]+([a-zA-Z0-9_-]{10,})', page_html) or \
-                                      re.search(r'kalturaIframe.*?entry_id=([a-zA-Z0-9_-]+)', page_html)
-                      if kaltura_match:
-                          eid = kaltura_match.group(1)
-                          # Kaltura direct stream endpoint for Sport5 (partner 2568011)
+                      # Case 2: Direct Akamai / Sport5 manifest m3u8
+                      match_direct = re.findall(r'(https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*)', page_html)
+                      for stream in match_direct:
+                          if "watch.sport5.co.il" in stream and "src=" in stream:
+                              stream = stream.split("src=")[-1]
+                          stream = stream.split("___")[0].split("\\u0026")[0].split("&")[0]
+                          stream = urllib.parse.unquote(stream).strip()
+                          if ".m3u8" in stream:
+                              idx = stream.find(".m3u8")
+                              return stream[:idx + 5]
+
+                      # Case 3: Kaltura entry ID
+                      match_kaltura = re.search(r'entry_id["\':\s=]+([a-zA-Z0-9_-]{10,})', page_html)
+                      if match_kaltura:
+                          eid = match_kaltura.group(1)
                           return f"https://cdnapisec.kaltura.com/p/2568011/sp/256801100/playManifest/entryId/{eid}/format/applehttp/protocol/https/manifest.m3u8"
-
-                      # 3. Look for direct mp4 links
-                      mp4_match = re.search(r'(https?://[^\s"\'<>]+\.mp4)', page_html)
-                      if mp4_match:
-                          return mp4_match.group(1)
               except Exception:
                   pass
               return None
 
           if mode == "direct":
               if raw_query.startswith("http"):
-                  stream = extract_media_stream(raw_query)
-                  targets.append(stream or raw_query)
+                  stream = extract_clean_stream(raw_query)
+                  targets.append((stream or raw_query, "direct_item"))
 
           else:
               feed_sources = [
                   "https://www.sport5.co.il/sitemap/articles/news-sitemap.xml",
-                  "https://www.sport5.co.il/sitemap/articles/sitemap_index.xml",
-                  "https://www.sport5.co.il/vod"
+                  "https://www.sport5.co.il/sitemap/articles/sitemap_index.xml"
               ]
 
               print(f"Query: '{raw_query}', Mode: '{mode}'")
@@ -153,36 +159,20 @@ jobs:
                       with urllib.request.urlopen(req, timeout=12) as resp:
                           content = resp.read().decode("utf-8", errors="ignore")
 
-                          # Check if it's XML sitemap
-                          if "<url>" in content:
-                              for block in re.findall(r'<url>(.*?)</url>', content, re.DOTALL):
-                                  loc_m = re.search(r'<loc>(.*?)</loc>', block)
-                                  title_m = re.search(r'<news:title>(.*?)</news:title>', block) or re.search(r'<title>(.*?)</title>', block)
-                                  if loc_m:
-                                      loc = html.unescape(loc_m.group(1).strip())
-                                      title = html.unescape(title_m.group(1).strip()) if title_m else ""
-                                      candidates.append((loc, title))
-                          # Check if it's HTML page (like /vod)
-                          else:
-                              soup = BeautifulSoup(content, "html.parser")
-                              for a in soup.find_all("a", href=True):
-                                  href = a["href"]
-                                  if "articles.aspx" in href and "docID=" in href:
-                                      full_url = href if href.startswith("http") else f"https://www.sport5.co.il/{href.lstrip('/')}"
-                                      full_url = html.unescape(full_url)
-                                      title = a.get_text() or ""
-                                      candidates.append((full_url, title.strip()))
+                          for block in re.findall(r'<url>(.*?)</url>', content, re.DOTALL):
+                              loc_m = re.search(r'<loc>(.*?)</loc>', block)
+                              title_m = re.search(r'<news:title>(.*?)</news:title>', block) or re.search(r'<title>(.*?)</title>', block)
+                              if loc_m:
+                                  loc = html.unescape(loc_m.group(1).strip())
+                                  title = html.unescape(title_m.group(1).strip()) if title_m else ""
+                                  candidates.append((loc, title))
                   except Exception as e:
-                      print(f"Source notice ({src_url}): {e}")
+                      print(f"Notice ({src_url}): {e}")
 
-              print(f"Collected {len(candidates)} candidate articles.")
+              print(f"Collected {len(candidates)} candidates. Filtering active media...")
 
-              # Prioritize items matching query or media indicators
-              video_indicators = ["\u05ea\u05e7\u05e6\u05d9\u05e8", "\u05e6\u05e4\u05d5", "\u05d5\u05d9\u05d3\u05d0\u05d5", "video", "vod"]
-
-              checked_count = 0
               for loc, title in candidates:
-                  if checked_count > 40 or len(targets) >= count:
+                  if len(targets) >= count:
                       break
 
                   t_low = title.lower()
@@ -192,33 +182,40 @@ jobs:
                   if mode == "search":
                       match = any(k in t_low or k in l_low for k in search_keys)
                   elif mode == "latest":
-                      match = any(v in t_low for v in video_indicators) or "FolderID=3075" in loc
+                      match = True
 
-                  if match or len(candidates) < 15:
-                      checked_count += 1
-                      stream_url = extract_media_stream(loc)
+                  if match:
+                      stream_url = extract_clean_stream(loc)
                       if stream_url:
-                          print(f"Found active media stream: {stream_url[:70]}...")
-                          targets.append(stream_url)
-                      else:
-                          # If direct stream not found by regex, still add page for generic yt-dlp retry
-                          targets.append(loc)
+                          safe_title = re.sub(r'[ /\\:*?"<>|]+', '_', title)[:70] or "item"
+                          print(f"Resolved valid video stream for: {title[:40]}")
+                          targets.append((stream_url, safe_title))
+
+          # Fallback: if search matched 0 items, scan recent candidates for any video
+          if not targets and candidates:
+              print("No match found, falling back to recent available videos...")
+              for loc, title in candidates[:30]:
+                  stream_url = extract_clean_stream(loc)
+                  if stream_url:
+                      safe_title = re.sub(r'[ /\\:*?"<>|]+', '_', title)[:70] or "item"
+                      targets.append((stream_url, safe_title))
+                      if len(targets) >= count:
+                          break
 
           clean_targets = targets[:count]
-          with open("targets.txt", "w", encoding="utf-8") as f:
-              for u in clean_targets:
-                  f.write(u.strip() + "\n")
+          with open("targets.tsv", "w", encoding="utf-8") as f:
+              for url, name in clean_targets:
+                  f.write(f"{url.strip()}\t{name.strip()}\n")
 
-          print(f"Total resolved targets: {len(clean_targets)}")
-          for u in clean_targets:
+          print(f"Total resolved target streams: {len(clean_targets)}")
+          for u, n in clean_targets:
               print(f"-> {u}")
           PY
-          sed -i 's/\r//g' targets.txt
+          sed -i 's/\r//g' targets.tsv
 
       - name: Download target items
         env:
           QUALITY: ${{ inputs.quality }}
-          COUNT: ${{ inputs.count }}
         run: |
           mkdir -p out
 
@@ -229,14 +226,10 @@ jobs:
             *)    FMT_ARGS="-f bv*+ba/b --merge-output-format mp4" ;;
           esac
 
-          max_items=${COUNT:-3}
-          downloaded=0
-
-          while IFS= read -r URL; do
-            URL=$(echo "$URL" | tr -d '\r\n' | xargs)
+          while IFS=$'\t' read -r URL TITLE; do
             [ -z "$URL" ] && continue
-            echo "Processing item: $URL"
-            if yt-dlp \
+            echo "Downloading media stream: $URL"
+            yt-dlp \
               $FMT_ARGS \
               --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
               --referer "https://www.sport5.co.il/" \
@@ -244,18 +237,9 @@ jobs:
               --retries 5 --fragment-retries 10 \
               --embed-metadata \
               --ffmpeg-location "$FFMPEG_BIN" \
-              -o "out/%(title).100B [%(id)s].%(ext)s" \
-              -- "$URL"; then
-              downloaded=$((downloaded + 1))
-              echo "Successfully downloaded $downloaded / $max_items"
-              if [ "$downloaded" -ge "$max_items" ]; then
-                echo "Target count reached ($downloaded items)."
-                break
-              fi
-            else
-              echo "Item download failed, moving to next candidate..."
-            fi
-          done < targets.txt
+              -o "out/${TITLE}.%(ext)s" \
+              -- "$URL" || echo "Stream error, continuing..."
+          done < targets.tsv
 
       - name: Package safe archives (max 1.8GB)
         run: |
