@@ -7,13 +7,11 @@ on:
       category:
         description: 'Target Category'
         required: true
-        default: 'european_league'
+        default: 'domestic_league'
         type: choice
         options:
-          - 'european_league'    # Champions League (FolderID 378)
-          - 'domestic_league'    # Israeli Premier League (FolderID 127)
-          - 'secondary_league'   # Liga Leumit (FolderID 3075)
-          - 'court_league'       # Basketball / EuroLeague (FolderID 64)
+          - 'domestic_league'    # Israeli Premier League Highlights
+          - 'european_league'    # Champions League Highlights
           - 'latest_feed'        # All latest video highlights
           - 'query_search'       # Search specific team
       query:
@@ -31,7 +29,6 @@ on:
           - '3'
           - '5'
           - '10'
-          - '20'
       action_type:
         description: 'Action Mode'
         required: true
@@ -87,16 +84,16 @@ jobs:
           import urllib.request, urllib.parse, re, os, sys, html, json
           from bs4 import BeautifulSoup
 
-          category = os.environ.get("CATEGORY", "european_league")
+          category = os.environ.get("CATEGORY", "domestic_league")
           raw_query = os.environ.get("QUERY", "").strip()
           max_items = int(os.environ.get("SCOPE", "3"))
           action_type = os.environ.get("ACTION", "download")
 
-          folder_map = {
-              "domestic_league": "127",
-              "european_league": "378",
-              "secondary_league": "3075",
-              "court_league": "64"
+          # Tag endpoints dedicated purely to match highlights
+          tag_map = {
+              "domestic_league": "https://www.sport5.co.il/tag/%D7%AA%D7%A7%D7%A6%D7%99%D7%A8%D7%99_%D7%9C%D7%99%D7%92%D7%AA_%D7%94%D7%A2%D7%9C",
+              "european_league": "https://www.sport5.co.il/tag/%D7%AA%D7%A7%D7%A6%D7%99%D7%A8%D7%99_%D7%9C%D7%99%D7%92%D7%AA_%D7%94%D7%90%D7%9c%D7%95%D7%A4%D7%95%D7%AA",
+              "latest_feed": "https://www.sport5.co.il/tag/%D7%AA%D7%A7%D7%A6%D7%99%D7%A8%D7%99%D7%9D"
           }
 
           aliases = {
@@ -104,10 +101,7 @@ jobs:
               "real madrid": ["real madrid", "\u05e8\u05d9\u05d0\u05dc \u05de\u05d3\u05e8\u05d9\u05d3", "\u05e8\u05d9\u05d0\u05dc"],
               "maccabi": ["maccabi", "\u05de\u05db\u05d1\u05d9"],
               "haifa": ["haifa", "\u05d7\u05d9\u05e4\u05d4"],
-              "tel aviv": ["tel aviv", "\u05ea\u05dc \u05d0\u05d1\u05d9\u05d1"],
-              "arsenal": ["arsenal", "\u05d0\u05e8\u05e1\u05e0\u05dc"],
-              "chelsea": ["chelsea", "\u05e6'\u05dc\u05e1\u05d9"],
-              "liverpool": ["liverpool", "\u05dc\u05d9\u05d1\u05e8\u05e4\u05d5\u05dc"]
+              "tel aviv": ["tel aviv", "\u05ea\u05dc \u05d0\u05d1\u05d9\u05d1"]
           }
 
           q_low = raw_query.lower()
@@ -126,100 +120,75 @@ jobs:
               t = re.sub(r'[ /\\:*?"<>|]+', '_', t)
               return t.strip('_')[:80] or "video_item"
 
-          def extract_article_video(page_url):
-              """Extract video ONLY if it belongs to this article, ignoring sidebar widgets"""
-              doc_m = re.search(r'docID=(\d+)', page_url)
-              if not doc_m:
-                  return None, None
-              doc_id = doc_m.group(1)
-
+          def extract_clean_stream(page_url):
+              """Extract direct m3u8 Akamai stream from article page"""
               try:
                   req = urllib.request.Request(page_url, headers=headers)
                   with urllib.request.urlopen(req, timeout=10) as r:
                       page_html = r.read().decode("utf-8", errors="ignore")
 
-                  soup = BeautifulSoup(page_html, "html.parser")
+                  match_watch = re.search(r'watch\.sport5\.co\.il\?src=([^"\'<>\s]+)', page_html)
+                  if match_watch:
+                      raw_src = match_watch.group(1)
+                      clean = raw_src.split("___")[0].split("\\u0026")[0].split("&")[0]
+                      clean = urllib.parse.unquote(clean).strip()
+                      if ".m3u8" in clean:
+                          idx = clean.find(".m3u8")
+                          return clean[:idx + 5]
 
-                  # 1. Check schema.org VideoObject for genuine article video
-                  for s in soup.find_all("script", type="application/ld+json"):
-                      try:
-                          j = json.loads(s.string or "{}")
-                          if isinstance(j, dict) and j.get("@type") == "VideoObject":
-                              v_name = j.get("name") or ""
-                              c_url = j.get("contentUrl") or j.get("embedUrl") or ""
-                              if ".m3u8" in c_url:
-                                  return c_url, clean_title(v_name)
-                      except Exception:
-                          pass
-
-                  # 2. Extract watch player ONLY if referrer matches our docID
-                  watch_matches = re.finditer(r'watch\.sport5\.co\.il\?src=([^"\'<>\s]+)', page_html)
-                  for wm in watch_matches:
-                      raw_param = wm.group(1)
-                      # Verify that this player belongs to the current docID
-                      if f"docID={doc_id}" in raw_param or f"docID%3D{doc_id}" in raw_param or f"docID%26{doc_id}" in raw_param:
-                          clean_src = raw_param.split("___")[0].split("\\u0026")[0].split("&")[0]
-                          clean_src = urllib.parse.unquote(clean_src).strip()
-                          if ".m3u8" in clean_src:
-                              idx = clean_src.find(".m3u8")
-                              stream = clean_src[:idx + 5]
-                              # Find video title inside main article container
-                              art_title = ""
-                              h1 = soup.find("h1")
-                              if h1:
-                                  art_title = h1.get_text()
-                              return stream, clean_title(art_title)
-
+                  matches = re.findall(r'(https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*)', page_html)
+                  for stream in matches:
+                      if "watch.sport5.co.il" in stream and "src=" in stream:
+                          stream = stream.split("src=")[-1]
+                      stream = stream.split("___")[0].split("\\u0026")[0].split("&")[0]
+                      stream = urllib.parse.unquote(stream).strip()
+                      if ".m3u8" in stream:
+                          idx = stream.find(".m3u8")
+                          return stream[:idx + 5]
               except Exception:
                   pass
-              return None, None
+              return None
 
           candidates = []
 
-          # Target League URL builder
-          if category in folder_map:
-              target_fid = folder_map[category]
-              print(f"Scraping category specific feed: FolderID {target_fid}")
-              # Scrape the category pages directly
-              for page in range(1, 5):
-                  cat_url = f"https://www.sport5.co.il/articles.aspx?FolderID={target_fid}&page={page}"
-                  try:
-                      req = urllib.request.Request(cat_url, headers=headers)
-                      with urllib.request.urlopen(req, timeout=12) as resp:
-                          soup = BeautifulSoup(resp.read().decode("utf-8", errors="ignore"), "html.parser")
-                          for a in soup.find_all("a", href=True):
-                              h = a["href"]
-                              if "articles.aspx" in h and "docID=" in h:
-                                  full_link = h if h.startswith("http") else f"https://www.sport5.co.il/{h.lstrip('/')}"
-                                  full_link = html.unescape(full_link)
-                                  t = (a.get_text() or "").strip()
-                                  if (full_link, t) not in candidates:
-                                      candidates.append((full_link, t))
-                  except Exception as e:
-                      print(f"Category page fetch note: {e}")
+          # 1. Scrape dedicated highlights tag pages
+          target_url = tag_map.get(category, tag_map["latest_feed"])
+          print(f"Scraping dedicated highlights repository: {target_url}")
 
-          else:
-              # Sitemaps for latest / search
-              sitemap_urls = [
-                  "https://www.sport5.co.il/sitemap/articles/news-sitemap.xml",
-                  "https://www.sport5.co.il/sitemap/articles/sitemap_index.xml"
-              ]
-              for s_url in sitemap_urls:
-                  try:
-                      req = urllib.request.Request(s_url, headers=headers)
-                      with urllib.request.urlopen(req, timeout=12) as resp:
-                          content = resp.read().decode("utf-8", errors="ignore")
-                          for block in re.findall(r'<url>(.*?)</url>', content, re.DOTALL):
-                              loc_m = re.search(r'<loc>(.*?)</loc>', block)
-                              title_m = re.search(r'<news:title>(.*?)</news:title>', block) or re.search(r'<title>(.*?)</title>', block)
-                              if loc_m:
-                                  loc = html.unescape(loc_m.group(1).strip())
-                                  title = html.unescape(title_m.group(1).strip()) if title_m else ""
+          try:
+              req = urllib.request.Request(target_url, headers=headers)
+              with urllib.request.urlopen(req, timeout=12) as resp:
+                  soup = BeautifulSoup(resp.read().decode("utf-8", errors="ignore"), "html.parser")
+                  for a in soup.find_all("a", href=True):
+                      h = a["href"]
+                      if "articles.aspx" in h and "docID=" in h:
+                          full_link = h if h.startswith("http") else f"https://www.sport5.co.il/{h.lstrip('/')}"
+                          full_link = html.unescape(full_link)
+                          t = clean_title(a.get_text() or "")
+                          if len(t) > 5 and (full_link, t) not in candidates:
+                              candidates.append((full_link, t))
+          except Exception as e:
+              print(f"Highlight page note: {e}")
+
+          # 2. Add sitemap candidates as fallback
+          if len(candidates) < max_items:
+              s_url = "https://www.sport5.co.il/sitemap/articles/news-sitemap.xml"
+              try:
+                  req = urllib.request.Request(s_url, headers=headers)
+                  with urllib.request.urlopen(req, timeout=10) as resp:
+                      content = resp.read().decode("utf-8", errors="ignore")
+                      for block in re.findall(r'<url>(.*?)</url>', content, re.DOTALL):
+                          loc_m = re.search(r'<loc>(.*?)</loc>', block)
+                          title_m = re.search(r'<news:title>(.*?)</news:title>', block) or re.search(r'<title>(.*?)</title>', block)
+                          if loc_m:
+                              loc = html.unescape(loc_m.group(1).strip())
+                              title = clean_title(html.unescape(title_m.group(1).strip()) if title_m else "")
+                              if (loc, title) not in candidates:
                                   candidates.append((loc, title))
-                  except Exception:
-                      pass
+              except Exception:
+                  pass
 
-          print(f"Discovered {len(candidates)} candidate pages.")
+          print(f"Collected {len(candidates)} highlight candidate links.")
 
           resolved_items = []
           seen_streams = set()
@@ -236,25 +205,24 @@ jobs:
                   match = any(k in t_low or k in l_low for k in search_keys)
 
               if match:
-                  stream, v_title = extract_article_video(loc)
+                  stream = extract_clean_stream(loc)
                   if stream and stream not in seen_streams:
                       seen_streams.add(stream)
-                      final_name = v_title or clean_title(page_title)
                       resolved_items.append({
                           "stream": stream,
-                          "title": final_name,
+                          "title": page_title,
                           "page": loc
                       })
-                      print(f"[+] Verified video: {final_name}")
+                      print(f"[+] Found highlight: {page_title[:45]}")
 
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
-              summary.write(f"## Discovery Summary Report\n\n")
+              summary.write(f"## Highlights Catalog Summary\n\n")
               summary.write(f"- **Category:** `{category}`\n")
-              summary.write(f"- **Total Matched Videos:** `{len(resolved_items)}`\n\n")
-              summary.write("| # | Verified Title | Direct Stream Link |\n")
+              summary.write(f"- **Total Highlights Found:** `{len(resolved_items)}`\n\n")
+              summary.write("| # | Highlight Title | Stream Status |\n")
               summary.write("| :--- | :--- | :--- |\n")
               for idx, it in enumerate(resolved_items, 1):
-                  summary.write(f"| {idx} | `{it['title']}` | [Play Stream]({it['stream']}) |\n")
+                  summary.write(f"| {idx} | `{it['title']}` | Ready |\n")
 
           if action_type == "catalog_only" or not resolved_items:
               batches = []
@@ -299,7 +267,7 @@ jobs:
           fi
           echo "FFMPEG_BIN=$FFMPEG_BIN" >> "$GITHUB_ENV"
 
-      - name: Download verified batch items
+      - name: Download batch items
         env:
           BATCH_DATA: ${{ toJson(matrix.batch.items) }}
           QUALITY: ${{ inputs.quality }}
@@ -325,7 +293,7 @@ jobs:
               title = it["title"]
               out_path = f"out/{title}.%(ext)s"
 
-              print(f"Downloading verified: {title}")
+              print(f"Downloading: {title}")
               cmd = [
                   "yt-dlp",
                   *fmt_args,
@@ -341,7 +309,7 @@ jobs:
               try:
                   subprocess.run(cmd, check=True)
               except Exception as e:
-                  print(f"Download error on {title}: {e}")
+                  print(f"Download note on {title}: {e}")
           PY
 
       - name: Package batch to safe archives (max 1.8GB)
