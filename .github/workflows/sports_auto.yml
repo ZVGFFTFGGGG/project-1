@@ -7,16 +7,16 @@ on:
       mode:
         description: 'Operation Mode'
         required: true
-        default: 'latest'
+        default: 'search'
         type: choice
         options:
-          - 'latest'         # מושך את העדכונים האחרונים שעלו
-          - 'search'         # חיפוש חופשי
-          - 'direct'         # הדבקת קישור ישיר
+          - 'search'
+          - 'latest'
+          - 'direct'
       query:
         description: 'Target query or URL'
         required: false
-        default: 'ברצלונה'
+        default: 'Barcelona'
         type: string
       count:
         description: 'Item count'
@@ -70,83 +70,108 @@ jobs:
           COUNT: ${{ inputs.count }}
         run: |
           python - <<'PY'
-          import urllib.request, xml.etree.ElementTree as ET, os, sys
+          import urllib.request, re, os, sys
 
-          mode = os.environ.get("MODE", "latest")
-          query = os.environ.get("QUERY", "").strip()
+          mode = os.environ.get("MODE", "search")
+          raw_query = os.environ.get("QUERY", "").strip()
           count = int(os.environ.get("COUNT", "3"))
 
-          # מיפוי שמות באנגלית לעברית למקרה שהמשתמש מקליד באנגלית
-          alias_map = {
-              "barcelona": "ברצלונה",
-              "real madrid": "ריאל מדריד",
-              "real": "ריאל",
-              "maccabi": "מכבי",
-              "haifa": "חיפה",
-              "tel aviv": "תל אביב",
-              "arsenal": "ארסנל",
-              "chelsea": "צ'לסי",
-              "liverpool": "ליברפול",
-              "champions": "אלופות"
+          # Unicode-safe mapping (keeps the YAML file 100% clean of raw Hebrew characters)
+          aliases = {
+              "barcelona": ["barcelona", "\u05d1\u05e8\u05e6\u05dc\u05d5\u05e0\u05d4", "\u05d1\u05d0\u05e8\u05e1\u05d4"],
+              "real madrid": ["real madrid", "\u05e8\u05d9\u05d0\u05dc \u05de\u05d3\u05e8\u05d9\u05d3", "\u05e8\u05d9\u05d0\u05dc"],
+              "real": ["real", "\u05e8\u05d9\u05d0\u05dc"],
+              "maccabi": ["maccabi", "\u05de\u05db\u05d1\u05d9"],
+              "haifa": ["haifa", "\u05d7\u05d9\u05e4\u05d4"],
+              "tel aviv": ["tel aviv", "\u05ea\u05dc \u05d0\u05d1\u05d9\u05d1"],
+              "arsenal": ["arsenal", "\u05d0\u05e8\u05e1\u05e0\u05dc"],
+              "chelsea": ["chelsea", "\u05e6'\u05dc\u05e1\u05d9", "\u05e6\u05dc\u05e1\u05d9"],
+              "liverpool": ["liverpool", "\u05dc\u05d9\u05d1\u05e8\u05e4\u05d5\u05dc"],
+              "champions": ["champions", "\u05d0\u05dc\u05d5\u05e4\u05d5\u05ea"],
           }
 
-          q_low = query.lower()
-          search_terms = [query.lower()]
-          if q_low in alias_map:
-              search_terms.append(alias_map[q_low])
+          q_lower = raw_query.lower()
+          search_keys = [q_lower]
+          if q_lower in aliases:
+              search_keys.extend(aliases[q_lower])
 
           targets = []
 
           if mode == "direct":
-              if query.startswith("http"):
-                  targets.append(query)
+              if raw_query.startswith("http"):
+                  targets.append(raw_query)
 
           else:
-              # רשימת ערוצי ה-RSS הרשמיים של Sport5 ו-ONE
-              rss_feeds = [
-                  "https://www.sport5.co.il/Rss/RssArticles.aspx",
-                  "https://www.sport5.co.il/Rss/RssVideo.aspx",
-                  "https://www.one.co.il/cat/coop/xml/rss/newsfeed.aspx"
+              feed_sources = [
+                  "https://www.sport5.co.il/sitemap/articles/news-sitemap.xml",
+                  "https://www.sport5.co.il/sitemap/games/news-sitemap.xml",
+                  "https://www.ynet.co.il/Integration/StoryRss3.xml"
               ]
 
               headers = {
                   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)"
               }
 
-              print(f"Scanning official feeds. Query: '{query}', Mode: '{mode}'")
+              print(f"Query: '{raw_query}', Keys: {search_keys}, Mode: '{mode}'")
+              candidate_pool = []
 
-              for feed_url in rss_feeds:
+              for src_url in feed_sources:
                   try:
-                      req = urllib.request.Request(feed_url, headers=headers)
+                      req = urllib.request.Request(src_url, headers=headers)
                       with urllib.request.urlopen(req, timeout=15) as resp:
-                          xml_data = resp.read()
-                          root = ET.fromstring(xml_data)
-                          for item in root.findall(".//item"):
-                              title = (item.find("title").text if item.find("title") is not None else "").strip()
-                              link = (item.find("link").text if item.find("link") is not None else "").strip()
+                          content = resp.read().decode("utf-8", errors="ignore")
 
-                              if not link or link in targets:
-                                  continue
+                          for block in re.findall(r'<url>(.*?)</url>', content, re.DOTALL):
+                              loc_m = re.search(r'<loc>(.*?)</loc>', block)
+                              title_m = re.search(r'<news:title>(.*?)</news:title>', block) or re.search(r'<title>(.*?)</title>', block)
+                              if loc_m:
+                                  loc = loc_m.group(1).strip()
+                                  title = title_m.group(1).strip() if title_m else ""
+                                  candidate_pool.append((loc, title))
 
-                              # במצב חיפוש - מחפש התאמה
-                              if mode == "search":
-                                  matched = any(term in title.lower() or term in link.lower() for term in search_terms)
-                                  if matched:
-                                      targets.append(link)
-                                      if len(targets) >= count:
-                                          break
-                              # במצב latest - לוקח את העדכונים האחרונים
-                              elif mode == "latest":
-                                  targets.append(link)
-                                  if len(targets) >= count:
-                                      break
+                          for block in re.findall(r'<item>(.*?)</item>', content, re.DOTALL):
+                              loc_m = re.search(r'<link>(.*?)</link>', block)
+                              title_m = re.search(r'<title>(.*?)</title>', block)
+                              if loc_m:
+                                  loc = loc_m.group(1).strip()
+                                  title = title_m.group(1).strip() if title_m else ""
+                                  candidate_pool.append((loc, title))
+
                   except Exception as e:
-                      print(f"Feed error ({feed_url}): {e}")
+                      print(f"Source note ({src_url}): {e}")
 
-                  if len(targets) >= count:
-                      break
+              print(f"Parsed {len(candidate_pool)} total candidates from active sitemaps.")
 
-          clean_targets = targets[:count]
+              media_hints = ["\u05ea\u05e7\u05e6\u05d9\u05e8", "\u05e6\u05e4\u05d5", "\u05d5\u05d9\u05d3\u05d0\u05d5"]
+
+              for loc, title in candidate_pool:
+                  if loc in targets:
+                      continue
+                  t_low = title.lower()
+                  l_low = loc.lower()
+
+                  if mode == "search":
+                      has_query = any(k in t_low or k in l_low for k in search_keys)
+                      if has_query:
+                          targets.append(loc)
+                          if len(targets) >= count * 3:
+                              break
+
+                  elif mode == "latest":
+                      has_media = any(hint in t_low for hint in media_hints)
+                      if has_media:
+                          targets.append(loc)
+                          if len(targets) >= count * 3:
+                              break
+
+              if not targets and candidate_pool:
+                  for loc, _ in candidate_pool:
+                      if loc not in targets:
+                          targets.append(loc)
+                          if len(targets) >= count:
+                              break
+
+          clean_targets = targets[:max(count, 1)]
           with open("targets.txt", "w", encoding="utf-8") as f:
               for u in clean_targets:
                   f.write(u.strip() + "\n")
@@ -160,6 +185,7 @@ jobs:
       - name: Download target items
         env:
           QUALITY: ${{ inputs.quality }}
+          COUNT: ${{ inputs.count }}
         run: |
           mkdir -p out
 
@@ -170,19 +196,30 @@ jobs:
             *)    FMT_ARGS="-f bv*+ba/b --merge-output-format mp4" ;;
           esac
 
+          max_items=${COUNT:-3}
+          downloaded=0
+
           while IFS= read -r URL; do
             URL=$(echo "$URL" | tr -d '\r\n' | xargs)
             [ -z "$URL" ] && continue
             echo "Processing item: $URL"
-            yt-dlp \
+            if yt-dlp \
               $FMT_ARGS \
               --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
               --no-playlist --no-progress --newline \
-              --retries 5 --fragment-retries 10 \
+              --retries 3 --fragment-retries 5 \
               --embed-metadata \
               --ffmpeg-location "$FFMPEG_BIN" \
               -o "out/%(title).100B [%(id)s].%(ext)s" \
-              -- "$URL" || echo "Item skipped on error"
+              -- "$URL"; then
+              downloaded=$((downloaded + 1))
+              if [ "$downloaded" -ge "$max_items" ]; then
+                echo "Target count reached ($downloaded items)."
+                break
+              fi
+            else
+              echo "Item has no direct media, continuing to next candidate..."
+            fi
           done < targets.txt
 
       - name: Package safe archives (max 1.8GB)
