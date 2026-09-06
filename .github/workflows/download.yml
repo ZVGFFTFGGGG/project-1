@@ -140,9 +140,7 @@ jobs:
           elif run_ytdlp $COOKIE_ARGS --impersonate chrome; then :
           elif run_ytdlp --extractor-args "$IMP" --extractor-args "$ALT"; then :
           else
-            echo "::error::download failed"
-            rm -f cookies.txt
-            exit 1
+            echo "::error::Download failed for $TARGET_URL"
           fi
           rm -f cookies.txt
 
@@ -150,29 +148,108 @@ jobs:
         if: always()
         run: rm -f cookies.txt
 
-      - name: Wrap the file in a ZIP (Netfree friendly)
-        if: success()
-        run: |
-          mkdir -p pack
-          FIRST=$(cd out && ls | head -1)
-          BASE="${FIRST%.*}"
-          [ -z "$BASE" ] && BASE="download"
-          (cd out && zip -r -0 -q "../pack/${BASE}.zip" .)
-          rm -rf out && mv pack out
-
-      - name: Publish as Release (Netfree-friendly download)
+      - name: Package and Upload Single Video
         if: success()
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: dl-${{ inputs.request_id }}
         run: |
+          mkdir -p pack
+          python - <<'PY'
+          import os, re, sys, zipfile
+
+          out_dir = "out"
+          pack_dir = "pack"
+          MAX_SIZE = int(1.8 * 1024 * 1024 * 1024)
+
+          files = [f for f in os.listdir(out_dir) if os.path.isfile(os.path.join(out_dir, f))]
+          raw_base = os.path.splitext(files[0])[0] if files else "download"
+          base_name = re.sub(r'[ /\\:*?"<>|]+', "_", raw_base)[:80] or "download"
+
+          for root, _, fnames in os.walk(out_dir):
+              for f in fnames:
+                  full = os.path.join(root, f)
+                  if os.path.getsize(full) > MAX_SIZE:
+                      part = 1
+                      chunks = []
+                      with open(full, "rb") as src:
+                          while True:
+                              data = src.read(MAX_SIZE)
+                              if not data:
+                                  break
+                              cpath = f"{full}.{part:03d}"
+                              with open(cpath, "wb") as dst:
+                                  dst.write(data)
+                              chunks.append(cpath)
+                              part += 1
+                      os.remove(full)
+                      bat_path = os.path.splitext(full)[0] + "_JOIN.bat"
+                      parts_str = " + ".join([f'"{os.path.basename(c)}"' for c in chunks])
+                      with open(bat_path, "w", encoding="utf-8") as bat:
+                          bat.write(f'@echo off\ncopy /b {parts_str} "{f}"\necho Done!\npause\n')
+
+          all_files = []
+          for root, _, fnames in os.walk(out_dir):
+              for f in fnames:
+                  full = os.path.join(root, f)
+                  rel = os.path.relpath(full, out_dir)
+                  all_files.append((full, rel, os.path.getsize(full)))
+          all_files.sort(key=lambda x: x[1])
+
+          total_sz = sum(f[2] for f in all_files)
+          if total_sz <= MAX_SIZE:
+              zpath = os.path.join(pack_dir, f"{base_name}.zip")
+              with zipfile.ZipFile(zpath, 'w', compression=zipfile.ZIP_STORED) as zf:
+                  for full, rel, _ in all_files:
+                      zf.write(full, rel)
+          else:
+              sub = 1
+              cur_sz = 0
+              zf = None
+              for full, rel, sz in all_files:
+                  if zf is None or (cur_sz + sz > MAX_SIZE and cur_sz > 0):
+                      if zf:
+                          zf.close()
+                      zpath = os.path.join(pack_dir, f"{base_name}_part{sub:02d}.zip")
+                      zf = zipfile.ZipFile(zpath, 'w', compression=zipfile.ZIP_STORED)
+                      sub += 1
+                      cur_sz = 0
+                  zf.write(full, rel)
+                  cur_sz += sz
+              if zf:
+                  zf.close()
+          PY
+
           gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
           gh release create "$TAG" --title "$TAG" --notes "Automated download - safe to delete."
-          find out -type f -print0 | while IFS= read -r -d '' f; do
+
+          FAILED_LIST=()
+          while IFS= read -r -d '' f; do
             esc=$(printf '%s' "$f" | sed 's/[][*?\\]/\\&/g')
-            gh release upload "$TAG" "$esc" --clobber
-          done
+            uploaded=0
+            for attempt in 1 2 3 4 5; do
+              echo "Uploading $f to release $TAG (attempt $attempt)..."
+              if gh release upload "$TAG" "$esc" --clobber; then
+                echo "Uploaded $f successfully!"
+                uploaded=1
+                break
+              fi
+              sleep 5
+            done
+            if [ "$uploaded" -eq 0 ]; then
+              echo "::error::Failed to upload $f after 5 attempts"
+              FAILED_LIST+=("$f")
+            fi
+          done < <(find pack -name "*.zip" -type f -print0)
+
+          if [ ${#FAILED_LIST[@]} -gt 0 ]; then
+            echo "### ⚠️ Upload Failures" >> "$GITHUB_STEP_SUMMARY"
+            for failed in "${FAILED_LIST[@]}"; do
+              echo "- \`$failed\`" >> "$GITHUB_STEP_SUMMARY"
+            done
+          fi
+
           {
             gh release list --limit 200 --json tagName,createdAt \
               --jq 'sort_by(.createdAt) | reverse | .[].tagName' 2>/dev/null \
@@ -425,6 +502,7 @@ jobs:
           try:
               data = AESGCM(key).decrypt(iv, ct, None)
           except Exception:
+              print("::error::cookie decryption failed")
               sys.exit(1)
           with open("cookies.txt", "wb") as f:
               f.write(data)
@@ -482,6 +560,8 @@ jobs:
             elif run_ytdlp "$TMPL" $COOKIE_ARGS --extractor-args "$ALT"; then :
             elif run_ytdlp "$TMPL" $COOKIE_ARGS --impersonate chrome; then :
             elif run_ytdlp "$TMPL" --extractor-args "$IMP" --extractor-args "$ALT"; then :
+            else
+              echo "::error::Failed to download video: $URL"
             fi
           done < batch.tsv
           rm -f batch.tsv cookies.txt
@@ -505,13 +585,36 @@ jobs:
           mkdir -p pack
 
           python - <<'PY'
-          import os, sys, zipfile
+          import os, re, sys, zipfile
 
-          base_name = """${COLLECTION_NAME:-collection}""".strip()
+          raw_name = os.environ.get("COLLECTION_NAME", "").strip() or "collection"
+          base_name = re.sub(r'[ /\\:*?"<>|]+', "_", raw_name)[:80] or "collection"
           part_num = f"{int(os.environ.get('BATCH_INDEX', 0)) + 1:02d}"
           out_dir = "out"
           pack_dir = "pack"
           MAX_SIZE = int(1.8 * 1024 * 1024 * 1024) # 1.8 GB limit
+
+          for root, _, files in os.walk(out_dir):
+              for f in files:
+                  full = os.path.join(root, f)
+                  if os.path.getsize(full) > MAX_SIZE:
+                      part = 1
+                      chunks = []
+                      with open(full, "rb") as src:
+                          while True:
+                              data = src.read(MAX_SIZE)
+                              if not data:
+                                  break
+                              cpath = f"{full}.{part:03d}"
+                              with open(cpath, "wb") as dst:
+                                  dst.write(data)
+                              chunks.append(cpath)
+                              part += 1
+                      os.remove(full)
+                      bat_path = os.path.splitext(full)[0] + "_JOIN.bat"
+                      parts_str = " + ".join([f'"{os.path.basename(c)}"' for c in chunks])
+                      with open(bat_path, "w", encoding="utf-8") as bat:
+                          bat.write(f'@echo off\ncopy /b {parts_str} "{f}"\necho Done!\npause\n')
 
           all_files = []
           for root, _, files in os.walk(out_dir):
@@ -519,6 +622,7 @@ jobs:
                   full = os.path.join(root, f)
                   rel = os.path.relpath(full, out_dir)
                   all_files.append((full, rel, os.path.getsize(full)))
+          all_files.sort(key=lambda x: x[1])
 
           total_size = sum(f[2] for f in all_files)
 
@@ -535,7 +639,7 @@ jobs:
                   if zf is None or (cur_size + sz > MAX_SIZE and cur_size > 0):
                       if zf:
                           zf.close()
-                      zip_path = os.path.join(pack_dir, f"{base_name}_part{part_num}_{sub}.zip")
+                      zip_path = os.path.join(pack_dir, f"{base_name}_part{part_num}_{sub:02d}.zip")
                       zf = zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_STORED)
                       sub += 1
                       cur_size = 0
@@ -545,17 +649,32 @@ jobs:
                   zf.close()
           PY
 
-          find pack -name "*.zip" -type f -print0 | while IFS= read -r -d '' f; do
+          FAILED_LIST=()
+          while IFS= read -r -d '' f; do
             esc=$(printf '%s' "$f" | sed 's/[][*?\\]/\\&/g')
+            uploaded=0
             for attempt in 1 2 3 4 5; do
               echo "Uploading $f to release $TAG (attempt $attempt)..."
               if gh release upload "$TAG" "$esc" --clobber; then
                 echo "Uploaded $f successfully!"
+                uploaded=1
                 break
               fi
               sleep 5
             done
-          done
+            if [ "$uploaded" -eq 0 ]; then
+              echo "::error::Failed to upload $f after 5 attempts"
+              FAILED_LIST+=("$f")
+            fi
+          done < <(find pack -name "*.zip" -type f -print0)
+
+          # יצירת סיכום שגיאות בדף הריצה אם היו כשלים
+          if [ ${#FAILED_LIST[@]} -gt 0 ]; then
+            echo "### ⚠️ Upload Failures in Batch ${{ matrix.batch.i }}" >> "$GITHUB_STEP_SUMMARY"
+            for failed in "${FAILED_LIST[@]}"; do
+              echo "- \`$failed\`" >> "$GITHUB_STEP_SUMMARY"
+            done
+          fi
 
   # --------------------------------------------------- collection: finish up
   package:
