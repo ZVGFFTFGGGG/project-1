@@ -1,0 +1,265 @@
+name: Sport5 Direct Downloader
+run-name: ⚽ ספורט 5 - ${{ inputs.query || 'תקצירים' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'בחר מצב'
+        required: true
+        default: 'search'
+        type: choice
+        options:
+          - 'search'         # חיפוש חופשי באתר ספורט 5 (למשל: ברצלונה, ריאל מדריד)
+          - 'latest'         # התקצירים האחרונים שעלו באתר ספורט 5
+          - 'direct_url'     # הדבקת קישור ישיר לכתבה בספורט 5
+      query:
+        description: 'שם קבוצה לחיפוש (למשל: ברצלונה, ריאל מדריד, מכבי חיפה, ארסנל)'
+        required: false
+        default: 'ברצלונה'
+        type: string
+      count:
+        description: 'כמות תקצירים'
+        required: true
+        default: '3'
+        type: choice
+        options:
+          - '1'
+          - '2'
+          - '3'
+          - '5'
+      quality:
+        description: 'איכות וידאו'
+        required: true
+        default: '1080'
+        type: choice
+        options:
+          - '1080'
+          - '720'
+          - '480'
+          - 'best'
+
+permissions:
+  contents: write
+
+jobs:
+  download-from-sport5:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache || true
+
+      - name: Set up Python & Tools
+        run: |
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet --upgrade yt-dlp imageio-ffmpeg curl_cffi requests beautifulsoup4
+          if command -v ffmpeg >/dev/null 2>&1; then
+            FFMPEG_BIN=$(command -v ffmpeg)
+          else
+            FFMPEG_BIN=$(python -c "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())")
+            chmod +x "$FFMPEG_BIN"
+          fi
+          echo "FFMPEG_BIN=$FFMPEG_BIN" >> "$GITHUB_ENV"
+
+      - name: Scrape Links from Sport5 Directly (No YouTube!)
+        env:
+          MODE: ${{ inputs.mode }}
+          QUERY: ${{ inputs.query }}
+          COUNT: ${{ inputs.count }}
+        run: |
+          python - <<'PY'
+          import requests, os, sys, re
+          from bs4 import BeautifulSoup
+          from urllib.parse import quote
+
+          mode = os.environ.get("MODE", "search")
+          query = os.environ.get("QUERY", "").strip()
+          count = int(os.environ.get("COUNT", "3"))
+
+          headers = {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          }
+
+          articles = []
+
+          if mode == "direct_url":
+              if query.startswith("http"):
+                  articles.append(query)
+
+          elif mode == "search":
+              print(f"מחפש ישירות באתר Sport5 עבור: '{query}'...")
+              search_url = f"https://www.sport5.co.il/SearchResults.aspx?SearchWord={quote(query)}"
+              try:
+                  res = requests.get(search_url, headers=headers, timeout=15)
+                  soup = BeautifulSoup(res.text, "html.parser")
+                  # חיפוש קישורים לכתבות וידאו בספורט 5
+                  for a in soup.find_all("a", href=True):
+                      href = a["href"]
+                      if "articles.aspx" in href or "docID=" in href:
+                          full_url = href if href.startswith("http") else f"https://www.sport5.co.il/{href.lstrip('/')}"
+                          if full_url not in articles:
+                              articles.append(full_url)
+                              if len(articles) >= count:
+                                  break
+              except Exception as e:
+                  print(f"שגיאה בסריקת האתר: {e}")
+
+          elif mode == "latest":
+              print("מחפש את התקצירים האחרונים בעמוד הווידאו של Sport5...")
+              vod_url = "https://www.sport5.co.il/vod"
+              try:
+                  res = requests.get(vod_url, headers=headers, timeout=15)
+                  soup = BeautifulSoup(res.text, "html.parser")
+                  for a in soup.find_all("a", href=True):
+                      href = a["href"]
+                      if "articles.aspx" in href or "docID=" in href:
+                          full_url = href if href.startswith("http") else f"https://www.sport5.co.il/{href.lstrip('/')}"
+                          if full_url not in articles:
+                              articles.append(full_url)
+                              if len(articles) >= count:
+                                  break
+              except Exception as e:
+                  print(f"שגיאה בסריקת עמוד הווידאו: {e}")
+
+          with open("targets.txt", "w", encoding="utf-8") as f:
+              for url in articles[:count]:
+                  f.write(url.strip() + "\n")
+
+          print(f"נמצאו {len(articles[:count])} כתבות וידאו מספורט 5:")
+          for u in articles[:count]:
+              print(f"- {u}")
+          PY
+
+      - name: Download Video Directly from Sport5 CDN
+        env:
+          QUALITY: ${{ inputs.quality }}
+        run: |
+          mkdir -p out
+
+          case "$QUALITY" in
+            1080) FMT_ARGS="-f bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b --merge-output-format mp4" ;;
+            720)  FMT_ARGS="-f bv*[height<=720]+ba/b[height<=720]/bv*+ba/b --merge-output-format mp4" ;;
+            480)  FMT_ARGS="-f bv*[height<=480]+ba/b[height<=480]/bv*+ba/b --merge-output-format mp4" ;;
+            *)    FMT_ARGS="-f bv*+ba/b --merge-output-format mp4" ;;
+          esac
+
+          while IFS= read -r URL; do
+            URL=$(echo "$URL" | tr -d '\r\n' | xargs)
+            [ -z "$URL" ] && continue
+            echo "=== מתחיל הורדה ישירה מספורט 5: $URL ==="
+            yt-dlp \
+              $FMT_ARGS \
+              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+              --referer "https://www.sport5.co.il/" \
+              --no-playlist --no-progress --newline \
+              --retries 5 --fragment-retries 10 \
+              --embed-metadata \
+              --ffmpeg-location "$FFMPEG_BIN" \
+              -o "out/%(title).100B [%(id)s].%(ext)s" \
+              -- "$URL" || echo "דילוג עקב שגיאה בסרטון ספציפי"
+          done < targets.txt
+
+      - name: Package to Netfree Safe ZIPs (max 1.8GB)
+        run: |
+          if [ -z "$(ls -A out 2>/dev/null)" ]; then
+            echo "::error::לא נמצאו סרטונים שהורדו."
+            exit 1
+          fi
+
+          mkdir -p pack
+          python - <<'PY'
+          import os, re, sys, zipfile
+
+          out_dir = "out"
+          pack_dir = "pack"
+          MAX_SIZE = int(1.8 * 1024 * 1024 * 1024)
+
+          for root, _, fnames in os.walk(out_dir):
+              for f in fnames:
+                  full = os.path.join(root, f)
+                  if os.path.getsize(full) > MAX_SIZE:
+                      part = 1
+                      chunks = []
+                      with open(full, "rb") as src:
+                          while True:
+                              data = src.read(MAX_SIZE)
+                              if not data:
+                                  break
+                              cpath = f"{full}.{part:03d}"
+                              with open(cpath, "wb") as dst:
+                                  dst.write(data)
+                              chunks.append(cpath)
+                              part += 1
+                      os.remove(full)
+                      bat_path = os.path.splitext(full)[0] + "_JOIN.bat"
+                      parts_str = " + ".join([f'"{os.path.basename(c)}"' for c in chunks])
+                      with open(bat_path, "w", encoding="utf-8") as bat:
+                          bat.write(f'@echo off\ncopy /b {parts_str} "{f}"\necho Joined!\npause\n')
+
+          all_files = []
+          for root, _, fnames in os.walk(out_dir):
+              for f in fnames:
+                  full = os.path.join(root, f)
+                  rel = os.path.relpath(full, out_dir)
+                  all_files.append((full, rel, os.path.getsize(full)))
+          all_files.sort(key=lambda x: x[1])
+
+          base_name = "Sport5_Highlights"
+          total_sz = sum(f[2] for f in all_files)
+          if total_sz <= MAX_SIZE:
+              zpath = os.path.join(pack_dir, f"{base_name}.zip")
+              with zipfile.ZipFile(zpath, 'w', compression=zipfile.ZIP_STORED) as zf:
+                  for full, rel, _ in all_files:
+                      zf.write(full, rel)
+          else:
+              sub = 1
+              cur_sz = 0
+              zf = None
+              for full, rel, sz in all_files:
+                  if zf is None or (cur_sz + sz > MAX_SIZE and cur_sz > 0):
+                      if zf:
+                          zf.close()
+                      zpath = os.path.join(pack_dir, f"{base_name}_part{sub:02d}.zip")
+                      zf = zipfile.ZipFile(zpath, 'w', compression=zipfile.ZIP_STORED)
+                      sub += 1
+                      cur_sz = 0
+                  zf.write(full, rel)
+                  cur_sz += sz
+              if zf:
+                  zf.close()
+          PY
+
+      - name: Create Release & Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: sport5-${{ github.run_id }}
+        run: |
+          gh release create "$TAG" --title "ספורט 5 - $(date +'%d/%m/%Y %H:%M')" --notes "הורדה ישירה מספורט 5"
+
+          while IFS= read -r -d '' f; do
+            esc=$(printf '%s' "$f" | sed 's/[][*?\\]/\\&/g')
+            for attempt in 1 2 3 4 5; do
+              echo "מעלה את $f..."
+              if gh release upload "$TAG" "$esc" --clobber; then
+                echo "הועלה בהצלחה!"
+                break
+              fi
+              sleep 5
+            done
+          done < <(find pack -name "*.zip" -type f -print0)
+
+      - name: Generate Summary Table
+        run: |
+          echo "## ⚽ רשימת התקצירים שהורדו ישירות מספורט 5" >> "$GITHUB_STEP_SUMMARY"
+          echo "| שם הקובץ | גודל |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| :--- | :--- |" >> "$GITHUB_STEP_SUMMARY"
+          for f in out/*; do
+            if [ -f "$f" ]; then
+              name=$(basename "$f")
+              size=$(du -h "$f" | cut -f1)
+              echo "| \`$name\` | $size |" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
