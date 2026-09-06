@@ -7,41 +7,41 @@ on:
       category:
         description: 'Target Category'
         required: true
-        default: 'latest_feed'
+        default: 'european_league'
         type: choice
         options:
-          - 'latest_feed'        # All latest video highlights across categories
-          - 'domestic_league'    # Israeli Premier League (FolderID 127)
           - 'european_league'    # Champions League (FolderID 378)
+          - 'domestic_league'    # Israeli Premier League (FolderID 127)
           - 'secondary_league'   # Liga Leumit (FolderID 3075)
           - 'court_league'       # Basketball / EuroLeague (FolderID 64)
-          - 'query_search'       # Custom text query
+          - 'latest_feed'        # All latest video highlights
+          - 'query_search'       # Search specific team
       query:
-        description: 'Query term (used if category is query_search)'
+        description: 'Search Query (used only if category is query_search)'
         required: false
         default: 'Barcelona'
         type: string
       scope:
-        description: 'Maximum items to collect'
+        description: 'Number of videos to download'
         required: true
-        default: '10'
+        default: '3'
         type: choice
         options:
+          - '1'
+          - '3'
           - '5'
           - '10'
           - '20'
-          - '30'
-          - '50'
       action_type:
-        description: 'Action'
+        description: 'Action Mode'
         required: true
         default: 'download'
         type: choice
         options:
-          - 'download'           # Full download and package
-          - 'catalog_only'       # List available items without downloading
+          - 'download'           # Download videos to Release
+          - 'catalog_only'       # Preview list only (do not download)
       quality:
-        description: 'Target Quality'
+        description: 'Video Quality'
         required: true
         default: '1080'
         type: choice
@@ -59,7 +59,6 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # ------------------------------------------------------------- Phase 1: Catalog & Enumerate
   enumerate:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -76,7 +75,7 @@ jobs:
           python -m pip install --quiet --upgrade pip
           python -m pip install --quiet --upgrade requests beautifulsoup4
 
-      - name: Build content catalog
+      - name: Build targeted catalog
         id: catalog
         env:
           CATEGORY: ${{ inputs.category }}
@@ -88,12 +87,11 @@ jobs:
           import urllib.request, urllib.parse, re, os, sys, html, json
           from bs4 import BeautifulSoup
 
-          category = os.environ.get("CATEGORY", "latest_feed")
+          category = os.environ.get("CATEGORY", "european_league")
           raw_query = os.environ.get("QUERY", "").strip()
-          max_items = int(os.environ.get("SCOPE", "10"))
+          max_items = int(os.environ.get("SCOPE", "3"))
           action_type = os.environ.get("ACTION", "download")
 
-          # Folder mappings
           folder_map = {
               "domestic_league": "127",
               "european_league": "378",
@@ -108,7 +106,7 @@ jobs:
               "haifa": ["haifa", "\u05d7\u05d9\u05e4\u05d4"],
               "tel aviv": ["tel aviv", "\u05ea\u05dc \u05d0\u05d1\u05d9\u05d1"],
               "arsenal": ["arsenal", "\u05d0\u05e8\u05e1\u05e0\u05dc"],
-              "chelsea": ["chelsea", "\u05e6'\u05dc\u05e1\u05d9", "\u05e6\u05dc\u05e1\u05d9"],
+              "chelsea": ["chelsea", "\u05e6'\u05dc\u05e1\u05d9"],
               "liverpool": ["liverpool", "\u05dc\u05d9\u05d1\u05e8\u05e4\u05d5\u05dc"]
           }
 
@@ -126,60 +124,64 @@ jobs:
               t = t.replace('<![CDATA[', '').replace(']]>', '')
               t = html.unescape(t).strip()
               t = re.sub(r'[ /\\:*?"<>|]+', '_', t)
-              return t.strip('_')[:80] or "item"
+              return t.strip('_')[:80] or "video_item"
 
-          def extract_clean_stream(page_url):
+          def extract_article_video(page_url):
+              """Extract video ONLY if it belongs to this article, ignoring sidebar widgets"""
+              doc_m = re.search(r'docID=(\d+)', page_url)
+              if not doc_m:
+                  return None, None
+              doc_id = doc_m.group(1)
+
               try:
                   req = urllib.request.Request(page_url, headers=headers)
                   with urllib.request.urlopen(req, timeout=10) as r:
                       page_html = r.read().decode("utf-8", errors="ignore")
 
-                  match_watch = re.search(r'watch\.sport5\.co\.il\?src=([^"\'<>\s]+)', page_html)
-                  if match_watch:
-                      raw_src = match_watch.group(1)
-                      clean = raw_src.split("___")[0].split("\\u0026")[0].split("&")[0]
-                      clean = urllib.parse.unquote(clean).strip()
-                      if ".m3u8" in clean:
-                          return clean[:clean.find(".m3u8") + 5]
+                  soup = BeautifulSoup(page_html, "html.parser")
 
-                  matches = re.findall(r'(https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*)', page_html)
-                  for stream in matches:
-                      if "watch.sport5.co.il" in stream and "src=" in stream:
-                          stream = stream.split("src=")[-1]
-                      stream = stream.split("___")[0].split("\\u0026")[0].split("&")[0]
-                      stream = urllib.parse.unquote(stream).strip()
-                      if ".m3u8" in stream:
-                          return stream[:stream.find(".m3u8") + 5]
+                  # 1. Check schema.org VideoObject for genuine article video
+                  for s in soup.find_all("script", type="application/ld+json"):
+                      try:
+                          j = json.loads(s.string or "{}")
+                          if isinstance(j, dict) and j.get("@type") == "VideoObject":
+                              v_name = j.get("name") or ""
+                              c_url = j.get("contentUrl") or j.get("embedUrl") or ""
+                              if ".m3u8" in c_url:
+                                  return c_url, clean_title(v_name)
+                      except Exception:
+                          pass
+
+                  # 2. Extract watch player ONLY if referrer matches our docID
+                  watch_matches = re.finditer(r'watch\.sport5\.co\.il\?src=([^"\'<>\s]+)', page_html)
+                  for wm in watch_matches:
+                      raw_param = wm.group(1)
+                      # Verify that this player belongs to the current docID
+                      if f"docID={doc_id}" in raw_param or f"docID%3D{doc_id}" in raw_param or f"docID%26{doc_id}" in raw_param:
+                          clean_src = raw_param.split("___")[0].split("\\u0026")[0].split("&")[0]
+                          clean_src = urllib.parse.unquote(clean_src).strip()
+                          if ".m3u8" in clean_src:
+                              idx = clean_src.find(".m3u8")
+                              stream = clean_src[:idx + 5]
+                              # Find video title inside main article container
+                              art_title = ""
+                              h1 = soup.find("h1")
+                              if h1:
+                                  art_title = h1.get_text()
+                              return stream, clean_title(art_title)
+
               except Exception:
                   pass
-              return None
+              return None, None
 
           candidates = []
 
-          # 1. Fetch from Sitemaps
-          sitemap_urls = [
-              "https://www.sport5.co.il/sitemap/articles/news-sitemap.xml",
-              "https://www.sport5.co.il/sitemap/articles/sitemap_index.xml"
-          ]
-          for s_url in sitemap_urls:
-              try:
-                  req = urllib.request.Request(s_url, headers=headers)
-                  with urllib.request.urlopen(req, timeout=12) as resp:
-                      content = resp.read().decode("utf-8", errors="ignore")
-                      for block in re.findall(r'<url>(.*?)</url>', content, re.DOTALL):
-                          loc_m = re.search(r'<loc>(.*?)</loc>', block)
-                          title_m = re.search(r'<news:title>(.*?)</news:title>', block) or re.search(r'<title>(.*?)</title>', block)
-                          if loc_m:
-                              loc = html.unescape(loc_m.group(1).strip())
-                              title = html.unescape(title_m.group(1).strip()) if title_m else ""
-                              candidates.append((loc, title))
-              except Exception:
-                  pass
-
-          # 2. Category deep page fetch if specific category selected
+          # Target League URL builder
           if category in folder_map:
               target_fid = folder_map[category]
-              for page in range(1, 4):
+              print(f"Scraping category specific feed: FolderID {target_fid}")
+              # Scrape the category pages directly
+              for page in range(1, 5):
                   cat_url = f"https://www.sport5.co.il/articles.aspx?FolderID={target_fid}&page={page}"
                   try:
                       req = urllib.request.Request(cat_url, headers=headers)
@@ -191,57 +193,69 @@ jobs:
                                   full_link = h if h.startswith("http") else f"https://www.sport5.co.il/{h.lstrip('/')}"
                                   full_link = html.unescape(full_link)
                                   t = (a.get_text() or "").strip()
-                                  candidates.append((full_link, t))
+                                  if (full_link, t) not in candidates:
+                                      candidates.append((full_link, t))
+                  except Exception as e:
+                      print(f"Category page fetch note: {e}")
+
+          else:
+              # Sitemaps for latest / search
+              sitemap_urls = [
+                  "https://www.sport5.co.il/sitemap/articles/news-sitemap.xml",
+                  "https://www.sport5.co.il/sitemap/articles/sitemap_index.xml"
+              ]
+              for s_url in sitemap_urls:
+                  try:
+                      req = urllib.request.Request(s_url, headers=headers)
+                      with urllib.request.urlopen(req, timeout=12) as resp:
+                          content = resp.read().decode("utf-8", errors="ignore")
+                          for block in re.findall(r'<url>(.*?)</url>', content, re.DOTALL):
+                              loc_m = re.search(r'<loc>(.*?)</loc>', block)
+                              title_m = re.search(r'<news:title>(.*?)</news:title>', block) or re.search(r'<title>(.*?)</title>', block)
+                              if loc_m:
+                                  loc = html.unescape(loc_m.group(1).strip())
+                                  title = html.unescape(title_m.group(1).strip()) if title_m else ""
+                                  candidates.append((loc, title))
                   except Exception:
                       pass
 
-          print(f"Total candidate articles gathered: {len(candidates)}")
+          print(f"Discovered {len(candidates)} candidate pages.")
 
-          # 3. Filter candidates and extract active video streams
           resolved_items = []
-          seen_urls = set()
+          seen_streams = set()
 
-          for loc, title in candidates:
+          for loc, page_title in candidates:
               if len(resolved_items) >= max_items:
                   break
-              if loc in seen_urls:
-                  continue
-              seen_urls.add(loc)
 
-              t_low = title.lower()
+              t_low = page_title.lower()
               l_low = loc.lower()
 
-              match = False
-              if category == "latest_feed":
-                  match = True
-              elif category in folder_map:
-                  match = f"folderid={folder_map[category]}" in l_low or True
-              elif category == "query_search":
+              match = True
+              if category == "query_search":
                   match = any(k in t_low or k in l_low for k in search_keys)
 
               if match:
-                  stream = extract_clean_stream(loc)
-                  if stream:
-                      safe_name = clean_title(title)
+                  stream, v_title = extract_article_video(loc)
+                  if stream and stream not in seen_streams:
+                      seen_streams.add(stream)
+                      final_name = v_title or clean_title(page_title)
                       resolved_items.append({
                           "stream": stream,
-                          "title": safe_name,
+                          "title": final_name,
                           "page": loc
                       })
-                      print(f"[+] Found stream: {safe_name}")
+                      print(f"[+] Verified video: {final_name}")
 
-          # 4. Generate GitHub Summary
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
-              summary.write(f"## Content Discovery Report\n\n")
+              summary.write(f"## Discovery Summary Report\n\n")
               summary.write(f"- **Category:** `{category}`\n")
-              summary.write(f"- **Mode:** `{action_type}`\n")
-              summary.write(f"- **Items Found:** `{len(resolved_items)}`\n\n")
-              summary.write("| # | Item Title | Direct Stream URL |\n")
+              summary.write(f"- **Total Matched Videos:** `{len(resolved_items)}`\n\n")
+              summary.write("| # | Verified Title | Direct Stream Link |\n")
               summary.write("| :--- | :--- | :--- |\n")
               for idx, it in enumerate(resolved_items, 1):
-                  summary.write(f"| {idx} | `{it['title']}` | [Link]({it['stream']}) |\n")
+                  summary.write(f"| {idx} | `{it['title']}` | [Play Stream]({it['stream']}) |\n")
 
-          # 5. Output batches for parallel download
           if action_type == "catalog_only" or not resolved_items:
               batches = []
           else:
@@ -257,7 +271,6 @@ jobs:
               out.write(f"count={len(resolved_items)}\n")
           PY
 
-  # ------------------------------------------------------------- Phase 2: Parallel Batch Download
   download-batch:
     needs: enumerate
     if: inputs.action_type == 'download' && fromJson(needs.enumerate.outputs.item_count) > 0
@@ -286,7 +299,7 @@ jobs:
           fi
           echo "FFMPEG_BIN=$FFMPEG_BIN" >> "$GITHUB_ENV"
 
-      - name: Download batch items
+      - name: Download verified batch items
         env:
           BATCH_DATA: ${{ toJson(matrix.batch.items) }}
           QUALITY: ${{ inputs.quality }}
@@ -312,7 +325,7 @@ jobs:
               title = it["title"]
               out_path = f"out/{title}.%(ext)s"
 
-              print(f"Processing: {title}")
+              print(f"Downloading verified: {title}")
               cmd = [
                   "yt-dlp",
                   *fmt_args,
@@ -328,13 +341,13 @@ jobs:
               try:
                   subprocess.run(cmd, check=True)
               except Exception as e:
-                  print(f"Error downloading {title}: {e}")
+                  print(f"Download error on {title}: {e}")
           PY
 
       - name: Package batch to safe archives (max 1.8GB)
         run: |
           if [ -z "$(ls -A out 2>/dev/null)" ]; then
-            echo "No media files created in this batch."
+            echo "No media files generated in this batch."
             exit 0
           fi
 
@@ -347,7 +360,6 @@ jobs:
           batch_id = "${{ matrix.batch.id }}"
           MAX_SIZE = int(1.8 * 1024 * 1024 * 1024)
 
-          # Auto split any file exceeding 1.8GB
           for root, _, fnames in os.walk(out_dir):
               for f in fnames:
                   full = os.path.join(root, f)
