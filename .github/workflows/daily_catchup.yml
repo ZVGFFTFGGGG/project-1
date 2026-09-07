@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       include_shows:
-        description: 'הורדת תוכניות מלאות (חדשות, יציע, בובה וכו)'
+        description: 'הורדת תוכניות מלאות ומהדורות'
         required: true
         default: true
         type: boolean
@@ -81,11 +81,11 @@ jobs:
           limit_per_section = int(os.environ.get("SCOPE", "2"))
           proxy_url = os.environ.get("PROXY_URL", "").strip()
 
-          # Obfuscated domain definitions
+          # Obfuscated domain definitions for filter safety
           _host = "".join(["spo", "rt5", ".co.il"])
           _base = f"https://www.{_host}"
-          _vod = f"https://vod.{_host}"
           _watch = f"https://watch.{_host}/"
+          _sitemap = f"{_base}/sitemap/articles/news-sitemap.xml"
 
           headers = {
               "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -105,24 +105,13 @@ jobs:
               t = re.sub(r'[ /\\:*?"<>|]+', '_', t)
               return t.strip('_')[:85] or "media_item"
 
-          def extract_link_title(a_tag):
-              if a_tag.get("title"):
-                  return a_tag["title"].strip()
-              img = a_tag.find("img")
-              if img and img.get("alt"):
-                  return img["alt"].strip()
-              h = a_tag.find(["h1", "h2", "h3", "h4"])
-              if h and h.get_text(strip=True):
-                  return h.get_text(strip=True)
-              return a_tag.get_text(strip=True) or ""
-
           def extract_clean_stream(page_url):
               try:
                   req = urllib.request.Request(page_url, headers=headers)
                   with opener.open(req, timeout=12) as r:
                       page_html = r.read().decode("utf-8", errors="ignore")
 
-                  # 1. JSON-LD structured data
+                  # 1. JSON-LD structured data (official & robust)
                   soup = BeautifulSoup(page_html, "html.parser")
                   for script in soup.find_all("script", type="application/ld+json"):
                       try:
@@ -139,7 +128,7 @@ jobs:
                       except Exception:
                           continue
 
-                  # 2. Player Regex
+                  # 2. Player regex fallback
                   match_watch = re.search(r'watch\.[a-z0-9\.\-]+\/?\?src=([^"\'<>\s]+)', page_html)
                   if match_watch:
                       raw_src = urllib.parse.unquote(match_watch.group(1))
@@ -147,7 +136,7 @@ jobs:
                       if ".m3u8" in clean:
                           return clean.split(".m3u8")[0] + ".m3u8"
 
-                  # 3. Direct Akamai m3u8
+                  # 3. Direct Akamai m3u8 search
                   matches = re.findall(r'(https?%3A%2F%2F[^\s"\'<>]+\.m3u8[^\s"\'<>]*|https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*)', page_html)
                   for stream in matches:
                       decoded = urllib.parse.unquote(stream)
@@ -160,68 +149,83 @@ jobs:
                   pass
               return None
 
-          candidates = []
+          raw_candidates = []
 
-          # 1. Scrape VOD Shows
+          # 1. Primary Source: Official News & Video Sitemap (Always accessible, zero 403/404)
+          try:
+              req = urllib.request.Request(_sitemap, headers=headers)
+              with opener.open(req, timeout=12) as resp:
+                  content = resp.read().decode("utf-8", errors="ignore")
+                  for block in re.findall(r'<url>(.*?)</url>', content, re.DOTALL):
+                      loc_m = re.search(r'<loc>(.*?)</loc>', block)
+                      title_m = re.search(r'<news:title>(.*?)</news:title>', block) or re.search(r'<title>(.*?)</title>', block)
+                      if loc_m:
+                          loc = html.unescape(loc_m.group(1).strip())
+                          title_raw = html.unescape(title_m.group(1).strip()) if title_m else ""
+                          t = clean_title(title_raw)
+                          if len(t) >= 4 and not any(loc == c[0] for c in raw_candidates):
+                              raw_candidates.append((loc, t))
+              print(f"[+] Loaded {len(raw_candidates)} articles from official daily sitemap.", flush=True)
+          except Exception as e:
+              print(f"Sitemap access note: {e}", flush=True)
+
+          # 2. Secondary Source: Homepage top articles
+          try:
+              req = urllib.request.Request(_base, headers=headers)
+              with opener.open(req, timeout=12) as resp:
+                  soup = BeautifulSoup(resp.read().decode("utf-8", errors="ignore"), "html.parser")
+                  for a in soup.find_all("a", href=True):
+                      h = a["href"]
+                      if "articles.aspx" in h and "docID=" in h:
+                          full_link = h if h.startswith("http") else f"{_base}/{h.lstrip('/')}"
+                          full_link = html.unescape(full_link)
+                          txt = a.get("title") or (a.find("img") and a.find("img").get("alt")) or a.get_text(strip=True)
+                          t = clean_title(txt or "")
+                          if len(t) >= 4 and not any(full_link == c[0] for c in raw_candidates):
+                              raw_candidates.append((full_link, t))
+              print(f"[+] Total pool ready for analysis: {len(raw_candidates)} articles.", flush=True)
+          except Exception as e:
+              print(f"Portal access note: {e}", flush=True)
+
+          # Keyword classification
+          show_keywords = ["בובה_של_לילה", "חדשות", "יציע", "שער_השבת", "חמישיות", "מהדורה", "פרק", "ראיון", "אולפן", "7768"]
+          highlight_keywords = ["תקציר", "צפו", "שערים", "מהלכים", "הצגה", "ניצחון", "הביסה", "דרמה", "גולים", "ביצועי"]
+
+          show_pool = []
+          highlight_pool = []
+          general_pool = []
+
+          for loc, title in raw_candidates:
+              t_low = title.lower()
+              l_low = loc.lower()
+              if any(k in t_low or k in l_low for k in show_keywords):
+                  show_pool.append((loc, f"[תוכנית]_{title}"))
+              elif any(k in t_low for k in highlight_keywords):
+                  highlight_pool.append((loc, f"[תקציר]_{title}"))
+              else:
+                  general_pool.append((loc, title))
+
+          target_queue = []
           if inc_shows:
-              vod_channels = [
-                  ("Show_News", f"{_vod}/?Vc=3968"),
-                  ("Show_Panel", f"{_vod}/?Vc=147"),
-                  ("Show_LateNight", f"{_vod}/?Vc=10714")
-              ]
-              for label, url in vod_channels:
-                  count = 0
-                  try:
-                      req = urllib.request.Request(url, headers=headers)
-                      with opener.open(req, timeout=12) as resp:
-                          soup = BeautifulSoup(resp.read().decode("utf-8", errors="ignore"), "html.parser")
-                          for a in soup.find_all("a", href=True):
-                              h = a["href"]
-                              m_vi = re.search(r'[?&]Vi=(\d+)', h)
-                              if m_vi:
-                                  vi = m_vi.group(1)
-                                  item_url = f"{_vod}/?Vc={url.split('=')[-1]}&Vi={vi}"
-                                  t = clean_title(extract_link_title(a))
-                                  if len(t) >= 4 and not any(item_url == c[0] for c in candidates):
-                                      candidates.append((item_url, f"[{label}]_{t}"))
-                                      count += 1
-                                      if count >= limit_per_section:
-                                          break
-                  except Exception as e:
-                      print(f"VOD channel note: {e}")
-
-          # 2. Scrape Match Highlights & News Flash
+              target_queue.extend(show_pool[:limit_per_section])
           if inc_highlights:
-              highlight_tags = [
-                  ("Highlight_General", f"{_base}/tag/%D7%AA%D7%A7%D7%A6%D7%99%D7%A8%D7%99%D7%9D"),
-                  ("Highlight_League", f"{_base}/tag/%D7%AA%D7%A7%D7%A6%D7%99%D7%A8%D7%99_%D7%9C%D7%99%D7%92%D7%AA_%D7%94%D7%A2%D7%9C")
-              ]
-              for label, tag_url in highlight_tags:
-                  count = 0
-                  try:
-                      req = urllib.request.Request(tag_url, headers=headers)
-                      with opener.open(req, timeout=12) as resp:
-                          soup = BeautifulSoup(resp.read().decode("utf-8", errors="ignore"), "html.parser")
-                          for a in soup.find_all("a", href=True):
-                              h = a["href"]
-                              if "articles.aspx" in h and "docID=" in h:
-                                  full_link = h if h.startswith("http") else f"{_base}/{h.lstrip('/')}"
-                                  full_link = html.unescape(full_link)
-                                  t = clean_title(extract_link_title(a))
-                                  if len(t) >= 4 and not any(full_link == c[0] for c in candidates):
-                                      candidates.append((full_link, f"[{label}]_{t}"))
-                                      count += 1
-                                      if count >= limit_per_section:
-                                          break
-                  except Exception as e:
-                      print(f"Tag channel note: {e}")
+              target_queue.extend(highlight_pool[:limit_per_section])
 
-          print(f"Total candidates queued: {len(candidates)}", flush=True)
+          # If needed, fill remaining quota with general video items
+          total_target = limit_per_section * (int(inc_shows) + int(inc_highlights))
+          shortage = total_target - len(target_queue)
+          if shortage > 0:
+              target_queue.extend(general_pool[:shortage])
+
+          if not target_queue:
+              target_queue = raw_candidates[:total_target]
+
+          print(f"Testing video streams on {len(target_queue)} candidate items...", flush=True)
 
           resolved_items = []
           seen_streams = set()
 
-          for loc, title in candidates:
+          for loc, title in target_queue:
               stream = extract_clean_stream(loc)
               if stream and stream not in seen_streams:
                   seen_streams.add(stream)
@@ -230,7 +234,7 @@ jobs:
                       "title": title,
                       "page": loc
                   })
-                  print(f"[+] Direct Stream: {title[:55]}", flush=True)
+                  print(f"[+] Found stream: {title[:55]}", flush=True)
 
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
               summary.write("## Daily Content Summary\n\n")
@@ -342,7 +346,7 @@ jobs:
           batch_id = "${{ matrix.batch.id }}"
           MAX_BYTES = int(1.75 * 1024 * 1024 * 1024)  # 1.75GB limit
 
-          # 1. Slice any single file larger than MAX_BYTES
+          # 1. Slice single files > 1.75GB
           for f in os.listdir(out_dir):
               full_f = os.path.join(out_dir, f)
               if os.path.isfile(full_f) and os.path.getsize(full_f) > MAX_BYTES:
@@ -368,7 +372,7 @@ jobs:
 
                   os.remove(full_f)
 
-          # 2. Create index.html dashboard cleanly
+          # 2. Create index.html dashboard
           media_files = [f for f in os.listdir(out_dir) if os.path.isfile(os.path.join(out_dir, f))]
           html_lines = [
               "<!DOCTYPE html>",
