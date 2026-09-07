@@ -85,7 +85,6 @@ jobs:
 
           limit_target = 9999 if scope_raw == "all" else int(scope_raw)
 
-          # Domain assembly
           _host = "".join(["spo", "rt5", ".co.il"])
           _base = f"https://www.{_host}"
           _watch = f"https://watch.{_host}/"
@@ -114,7 +113,6 @@ jobs:
                   with opener.open(req, timeout=12) as r:
                       page_html = r.read().decode("utf-8", errors="ignore")
 
-                  # 1. JSON-LD structured data
                   soup = BeautifulSoup(page_html, "html.parser")
                   for script in soup.find_all("script", type="application/ld+json"):
                       try:
@@ -131,7 +129,6 @@ jobs:
                       except Exception:
                           continue
 
-                  # 2. Player Regex
                   match_watch = re.search(r'watch\.[a-z0-9\.\-]+\/?\?src=([^"\'<>\s]+)', page_html)
                   if match_watch:
                       raw_src = urllib.parse.unquote(match_watch.group(1))
@@ -139,7 +136,6 @@ jobs:
                       if ".m3u8" in clean:
                           return clean.split(".m3u8")[0] + ".m3u8"
 
-                  # 3. Direct Akamai m3u8
                   matches = re.findall(r'(https?%3A%2F%2F[^\s"\'<>]+\.m3u8[^\s"\'<>]*|https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*)', page_html)
                   for stream in matches:
                       decoded = urllib.parse.unquote(stream)
@@ -154,7 +150,7 @@ jobs:
 
           raw_candidates = []
 
-          # Source A: Multi-sitemaps (Articles, Games, NBA feeds)
+          # Source A: Multiple Sitemaps
           sitemaps = [
               f"{_base}/sitemap/articles/news-sitemap.xml",
               f"{_base}/sitemap/games/news-sitemap.xml",
@@ -177,7 +173,7 @@ jobs:
               except Exception:
                   pass
 
-          # Source B: Category hubs (League, Champions, Shows, Homepage)
+          # Source B: Category hubs & Homepage
           category_pages = [
               f"{_base}/Folder.aspx?FolderID=64",
               f"{_base}/Folder.aspx?FolderID=393",
@@ -201,11 +197,10 @@ jobs:
               except Exception:
                   pass
 
-          print(f"[+] Total candidate articles gathered across portal: {len(raw_candidates)}", flush=True)
+          print(f"[+] Total candidate articles collected: {len(raw_candidates)}", flush=True)
 
-          # Prioritize Shows vs Highlights
-          show_keywords = ["בובה_של_לילה", "חדשות", "יציע", "שער_השבת", "חמישיות", "מהדורה", "פרק", "ראיון", "אולפן", "7768"]
-          highlight_keywords = ["תקציר", "צפו", "שערים", "מהלכים", "הצגה", "ניצחון", "הביסה", "דרמה", "גולים", "ביצועי"]
+          show_keywords = ["בובה_של_לילה", "חדשות", "יציע", "שער_השבת", "חמישיות", "מהדורה", "פרק", "ראיון", "אולפן", "עולים_לרגל", "7768"]
+          highlight_keywords = ["תקציר", "צפו", "שערים", "מהלכים", "הצגה", "ניצחון", "הביסה", "דרמה", "גולים", "ביצועי", "ufc"]
 
           show_pool = []
           highlight_pool = []
@@ -229,7 +224,6 @@ jobs:
           if inc_highlights:
               target_queue.extend(highlight_pool[:half_limit])
 
-          # Fill from general pool until limit is reached
           shortage = limit_target - len(target_queue)
           if shortage > 0:
               target_queue.extend(general_pool[:shortage])
@@ -237,7 +231,7 @@ jobs:
           if not target_queue:
               target_queue = raw_candidates[:limit_target]
 
-          print(f"Resolving direct video streams for {len(target_queue)} targets...", flush=True)
+          print(f"Testing direct streams on {len(target_queue)} targets...", flush=True)
 
           resolved_items = []
           seen_streams = set()
@@ -253,7 +247,7 @@ jobs:
                       "title": title,
                       "page": loc
                   })
-                  print(f"[+] Direct Video Ready ({len(resolved_items)}): {title[:50]}", flush=True)
+                  print(f"[+] Video Ready ({len(resolved_items)}): {title[:50]}", flush=True)
 
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
               summary.write("## Daily Content Summary\n\n")
@@ -336,7 +330,11 @@ jobs:
                   "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
                   "--referer", _ref,
                   "--no-playlist", "--no-progress", "--newline",
-                  "--retries", "5", "--fragment-retries", "10",
+                  "--concurrent-fragments", "5",       # מוריד 5 מקטעים במקביל - מהירות פי 5
+                  "--skip-unavailable-fragments",      # מדלג על מקטע תקול ולא מפיל את ההורדה
+                  "--socket-timeout", "15",            # לא ממתין יותר מ-15 שניות לשרת תקוע
+                  "--retries", "10",
+                  "--fragment-retries", "15",
                   "-o", out_path
               ]
 
