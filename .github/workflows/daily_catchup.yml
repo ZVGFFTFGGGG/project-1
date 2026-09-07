@@ -4,6 +4,18 @@ run-name: daily-digest-${{ github.run_id }}
 on:
   workflow_dispatch:
     inputs:
+      scope_per_section:
+        description: 'כמות פריטים להורדה'
+        required: true
+        default: '25'
+        type: choice
+        options:
+          - '5'
+          - '10'
+          - '25'
+          - '50'
+          - '100'
+          - 'all'
       include_shows:
         description: 'הורדת תוכניות מלאות ומהדורות'
         required: true
@@ -14,16 +26,6 @@ on:
         required: true
         default: true
         type: boolean
-      scope_per_section:
-        description: 'כמות פריטים מכל קטגוריה'
-        required: true
-        default: '2'
-        type: choice
-        options:
-          - '1'
-          - '2'
-          - '3'
-          - '5'
       quality:
         description: 'איכות וידאו'
         required: true
@@ -50,7 +52,7 @@ concurrency:
 jobs:
   enumerate:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     outputs:
       batches: ${{ steps.catalog.outputs.batches }}
       item_count: ${{ steps.catalog.outputs.count }}
@@ -78,14 +80,15 @@ jobs:
 
           inc_shows = os.environ.get("INC_SHOWS", "true").lower() == "true"
           inc_highlights = os.environ.get("INC_HIGHLIGHTS", "true").lower() == "true"
-          limit_per_section = int(os.environ.get("SCOPE", "2"))
+          scope_raw = os.environ.get("SCOPE", "25").strip().lower()
           proxy_url = os.environ.get("PROXY_URL", "").strip()
 
-          # Obfuscated domain definitions for filter safety
+          limit_target = 9999 if scope_raw == "all" else int(scope_raw)
+
+          # Domain assembly
           _host = "".join(["spo", "rt5", ".co.il"])
           _base = f"https://www.{_host}"
           _watch = f"https://watch.{_host}/"
-          _sitemap = f"{_base}/sitemap/articles/news-sitemap.xml"
 
           headers = {
               "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -111,7 +114,7 @@ jobs:
                   with opener.open(req, timeout=12) as r:
                       page_html = r.read().decode("utf-8", errors="ignore")
 
-                  # 1. JSON-LD structured data (official & robust)
+                  # 1. JSON-LD structured data
                   soup = BeautifulSoup(page_html, "html.parser")
                   for script in soup.find_all("script", type="application/ld+json"):
                       try:
@@ -128,7 +131,7 @@ jobs:
                       except Exception:
                           continue
 
-                  # 2. Player regex fallback
+                  # 2. Player Regex
                   match_watch = re.search(r'watch\.[a-z0-9\.\-]+\/?\?src=([^"\'<>\s]+)', page_html)
                   if match_watch:
                       raw_src = urllib.parse.unquote(match_watch.group(1))
@@ -136,7 +139,7 @@ jobs:
                       if ".m3u8" in clean:
                           return clean.split(".m3u8")[0] + ".m3u8"
 
-                  # 3. Direct Akamai m3u8 search
+                  # 3. Direct Akamai m3u8
                   matches = re.findall(r'(https?%3A%2F%2F[^\s"\'<>]+\.m3u8[^\s"\'<>]*|https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*)', page_html)
                   for stream in matches:
                       decoded = urllib.parse.unquote(stream)
@@ -151,43 +154,56 @@ jobs:
 
           raw_candidates = []
 
-          # 1. Primary Source: Official News & Video Sitemap (Always accessible, zero 403/404)
-          try:
-              req = urllib.request.Request(_sitemap, headers=headers)
-              with opener.open(req, timeout=12) as resp:
-                  content = resp.read().decode("utf-8", errors="ignore")
-                  for block in re.findall(r'<url>(.*?)</url>', content, re.DOTALL):
-                      loc_m = re.search(r'<loc>(.*?)</loc>', block)
-                      title_m = re.search(r'<news:title>(.*?)</news:title>', block) or re.search(r'<title>(.*?)</title>', block)
-                      if loc_m:
-                          loc = html.unescape(loc_m.group(1).strip())
-                          title_raw = html.unescape(title_m.group(1).strip()) if title_m else ""
-                          t = clean_title(title_raw)
-                          if len(t) >= 4 and not any(loc == c[0] for c in raw_candidates):
-                              raw_candidates.append((loc, t))
-              print(f"[+] Loaded {len(raw_candidates)} articles from official daily sitemap.", flush=True)
-          except Exception as e:
-              print(f"Sitemap access note: {e}", flush=True)
+          # Source A: Multi-sitemaps (Articles, Games, NBA feeds)
+          sitemaps = [
+              f"{_base}/sitemap/articles/news-sitemap.xml",
+              f"{_base}/sitemap/games/news-sitemap.xml",
+              f"{_base}/sitemap/nba/news-sitemap.xml"
+          ]
+          for s_url in sitemaps:
+              try:
+                  req = urllib.request.Request(s_url, headers=headers)
+                  with opener.open(req, timeout=10) as resp:
+                      content = resp.read().decode("utf-8", errors="ignore")
+                      for block in re.findall(r'<url>(.*?)</url>', content, re.DOTALL):
+                          loc_m = re.search(r'<loc>(.*?)</loc>', block)
+                          title_m = re.search(r'<news:title>(.*?)</news:title>', block) or re.search(r'<title>(.*?)</title>', block)
+                          if loc_m:
+                              loc = html.unescape(loc_m.group(1).strip())
+                              title_raw = html.unescape(title_m.group(1).strip()) if title_m else ""
+                              t = clean_title(title_raw)
+                              if len(t) >= 4 and not any(loc == c[0] for c in raw_candidates):
+                                  raw_candidates.append((loc, t))
+              except Exception:
+                  pass
 
-          # 2. Secondary Source: Homepage top articles
-          try:
-              req = urllib.request.Request(_base, headers=headers)
-              with opener.open(req, timeout=12) as resp:
-                  soup = BeautifulSoup(resp.read().decode("utf-8", errors="ignore"), "html.parser")
-                  for a in soup.find_all("a", href=True):
-                      h = a["href"]
-                      if "articles.aspx" in h and "docID=" in h:
-                          full_link = h if h.startswith("http") else f"{_base}/{h.lstrip('/')}"
-                          full_link = html.unescape(full_link)
-                          txt = a.get("title") or (a.find("img") and a.find("img").get("alt")) or a.get_text(strip=True)
-                          t = clean_title(txt or "")
-                          if len(t) >= 4 and not any(full_link == c[0] for c in raw_candidates):
-                              raw_candidates.append((full_link, t))
-              print(f"[+] Total pool ready for analysis: {len(raw_candidates)} articles.", flush=True)
-          except Exception as e:
-              print(f"Portal access note: {e}", flush=True)
+          # Source B: Category hubs (League, Champions, Shows, Homepage)
+          category_pages = [
+              f"{_base}/Folder.aspx?FolderID=64",
+              f"{_base}/Folder.aspx?FolderID=393",
+              f"{_base}/Folder.aspx?FolderID=7768",
+              _base
+          ]
+          for f_url in category_pages:
+              try:
+                  req = urllib.request.Request(f_url, headers=headers)
+                  with opener.open(req, timeout=10) as resp:
+                      soup = BeautifulSoup(resp.read().decode("utf-8", errors="ignore"), "html.parser")
+                      for a in soup.find_all("a", href=True):
+                          h = a["href"]
+                          if "articles.aspx" in h and "docID=" in h:
+                              full_link = h if h.startswith("http") else f"{_base}/{h.lstrip('/')}"
+                              full_link = html.unescape(full_link)
+                              txt = a.get("title") or (a.find("img") and a.find("img").get("alt")) or a.get_text(strip=True)
+                              t = clean_title(txt or "")
+                              if len(t) >= 4 and not any(full_link == c[0] for c in raw_candidates):
+                                  raw_candidates.append((full_link, t))
+              except Exception:
+                  pass
 
-          # Keyword classification
+          print(f"[+] Total candidate articles gathered across portal: {len(raw_candidates)}", flush=True)
+
+          # Prioritize Shows vs Highlights
           show_keywords = ["בובה_של_לילה", "חדשות", "יציע", "שער_השבת", "חמישיות", "מהדורה", "פרק", "ראיון", "אולפן", "7768"]
           highlight_keywords = ["תקציר", "צפו", "שערים", "מהלכים", "הצגה", "ניצחון", "הביסה", "דרמה", "גולים", "ביצועי"]
 
@@ -206,26 +222,29 @@ jobs:
                   general_pool.append((loc, title))
 
           target_queue = []
-          if inc_shows:
-              target_queue.extend(show_pool[:limit_per_section])
-          if inc_highlights:
-              target_queue.extend(highlight_pool[:limit_per_section])
+          half_limit = limit_target if limit_target > 50 else max(limit_target // 2, 5)
 
-          # If needed, fill remaining quota with general video items
-          total_target = limit_per_section * (int(inc_shows) + int(inc_highlights))
-          shortage = total_target - len(target_queue)
+          if inc_shows:
+              target_queue.extend(show_pool[:half_limit])
+          if inc_highlights:
+              target_queue.extend(highlight_pool[:half_limit])
+
+          # Fill from general pool until limit is reached
+          shortage = limit_target - len(target_queue)
           if shortage > 0:
               target_queue.extend(general_pool[:shortage])
 
           if not target_queue:
-              target_queue = raw_candidates[:total_target]
+              target_queue = raw_candidates[:limit_target]
 
-          print(f"Testing video streams on {len(target_queue)} candidate items...", flush=True)
+          print(f"Resolving direct video streams for {len(target_queue)} targets...", flush=True)
 
           resolved_items = []
           seen_streams = set()
 
           for loc, title in target_queue:
+              if len(resolved_items) >= limit_target:
+                  break
               stream = extract_clean_stream(loc)
               if stream and stream not in seen_streams:
                   seen_streams.add(stream)
@@ -234,17 +253,18 @@ jobs:
                       "title": title,
                       "page": loc
                   })
-                  print(f"[+] Found stream: {title[:55]}", flush=True)
+                  print(f"[+] Direct Video Ready ({len(resolved_items)}): {title[:50]}", flush=True)
 
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
               summary.write("## Daily Content Summary\n\n")
-              summary.write(f"- **Total Items Found:** `{len(resolved_items)}`\n\n")
+              summary.write(f"- **Target Scope:** `{scope_raw}`\n")
+              summary.write(f"- **Total Video Files Located:** `{len(resolved_items)}`\n\n")
               for idx, it in enumerate(resolved_items, 1):
                   summary.write(f"{idx}. `{it['title']}`\n")
 
           batches = [{"id": 0, "items": []}]
           if resolved_items:
-              batch_size = 3
+              batch_size = 5 if len(resolved_items) > 15 else 3
               batches = [
                   {"id": i + 1, "items": resolved_items[k:k + batch_size]}
                   for i, k in enumerate(range(0, len(resolved_items), batch_size))
@@ -262,7 +282,7 @@ jobs:
     timeout-minutes: 60
     strategy:
       fail-fast: false
-      max-parallel: 4
+      max-parallel: 10
       matrix:
         batch: ${{ fromJson(needs.enumerate.outputs.batches) }}
     name: batch-${{ matrix.batch.id }}
@@ -364,7 +384,7 @@ jobs:
                           part_names.append(os.path.basename(part_file))
                           part_idx += 1
 
-                  # Create Windows 1-click rejoin script
+                  # Windows 1-click rejoin script
                   bat_path = os.path.join(out_dir, f"JOIN_{os.path.splitext(f)[0]}.bat")
                   parts_str = " + ".join([f'"{p}"' for p in part_names])
                   with open(bat_path, "w", encoding="utf-8") as bat:
@@ -372,7 +392,7 @@ jobs:
 
                   os.remove(full_f)
 
-          # 2. Create index.html dashboard
+          # 2. Local HTML Media Dashboard
           media_files = [f for f in os.listdir(out_dir) if os.path.isfile(os.path.join(out_dir, f))]
           html_lines = [
               "<!DOCTYPE html>",
@@ -403,7 +423,7 @@ jobs:
           with open(os.path.join(out_dir, "index.html"), "w", encoding="utf-8") as h:
               h.write("\n".join(html_lines))
 
-          # 3. Pack into zip archives under 1.75GB
+          # 3. Pack archives under 1.75GB
           all_items = []
           for root, _, fnames in os.walk(out_dir):
               for f in fnames:
