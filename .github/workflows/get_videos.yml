@@ -1,0 +1,40 @@
+name: Get Channel Video List
+
+on:
+  workflow_dispatch: # מאפשר להפעיל את הריצה בלחיצת כפתור
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install yt-dlp
+        run: |
+          sudo wget https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -O /usr/local/bin/yt-dlp
+          sudo chmod a+rx /usr/local/bin/yt-dlp
+
+      - name: Fetch All Videos from Channel
+        run: |
+          # שליפת כל הסרטונים (רגילים, לייבים ו-shorts) כולל תאריך, כותרת ומזהה
+          # שימוש ב-flat-playlist מבטיח שליפה מהירה ללא חסימות בוטים
+          yt-dlp --flat-playlist \
+            --print "%(upload_date>%Y-%m-%d)s | %(title)s | https://www.youtube.com/watch?v=%(id)s" \
+            "https://www.youtube.com/@hapodium_sport/videos" > videos_regular.txt || true
+
+          yt-dlp --flat-playlist \
+            --print "%(upload_date>%Y-%m-%d)s | %(title)s | https://www.youtube.com/watch?v=%(id)s" \
+            "https://www.youtube.com/@hapodium_sport/streams" > videos_streams.txt || true
+
+          yt-dlp --flat-playlist \
+            --print "%(upload_date>%Y-%m-%d)s | %(title)s | https://www.youtube.com/watch?v=%(id)s" \
+            "https://www.youtube.com/@hapodium_sport/shorts" > videos_shorts.txt || true
+
+          # איחוד כל הקבצים לקובץ CSV אחד מסודר
+          echo "תאריך,כותרת,קישור" > hapodium_all_videos.csv
+          cat videos_regular.txt videos_streams.txt videos_shorts.txt | sort -r | sed 's/ | /,/g' >> hapodium_all_videos.csv
+
+      - name: Upload Video List Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hapodium-sport-full-list
+          path: hapodium_all_videos.csv
