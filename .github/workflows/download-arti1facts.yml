@@ -121,14 +121,14 @@ jobs:
               --no-playlist --no-progress --newline \
               --retries 3 --fragment-retries 10 \
               --embed-metadata \
+              --remote-components ejs:github \
               --ffmpeg-location "$FFMPEG_BIN" \
               -o "out/%(title).120B [%(id)s].%(ext)s" \
               -- "$TARGET_URL"
           }
 
-          IMP="generic:impersonate"
-          ALT="youtube:player_client=default,tv,web_safari,mweb"
-          if run_ytdlp $COOKIE_ARGS --extractor-args "$IMP"; then :
+          ALT="youtube:player_client=default,web,web_safari,ios"
+          if run_ytdlp $COOKIE_ARGS; then :
           elif { sleep 2; run_ytdlp $COOKIE_ARGS --extractor-args "$ALT"; }; then :
           elif { sleep 2; run_ytdlp $COOKIE_ARGS --impersonate chrome; }; then :
           else
@@ -326,7 +326,7 @@ jobs:
     continue-on-error: true
     strategy:
       fail-fast: false
-      max-parallel: 2 # הוגבל ל-2 במקביל כדי למנוע חסימת קצב מיוטיוב
+      max-parallel: 2 # 2 שרתים במקביל למניעת Rate Limit
       matrix:
         batch: ${{ fromJson(needs.enumerate.outputs.batches) }}
     name: download-item ${{ matrix.batch.i }}
@@ -411,20 +411,20 @@ jobs:
               --retries 3 --fragment-retries 10 \
               --sleep-requests 1.5 \
               --embed-metadata \
+              --remote-components ejs:github \
               --ffmpeg-location "$FFMPEG_BIN" \
               -o "$tmpl" \
               -- "$URL"
           }
 
-          IMP="generic:impersonate"
-          ALT="youtube:player_client=default,tv,web_safari,mweb"
+          ALT="youtube:player_client=default,web,web_safari,ios"
           while IFS=$'\t' read -r URL ALBUM; do
             [ -z "$URL" ] && continue
             TMPL="out/%(title).100B [%(id)s].%(ext)s"
             if [ -n "$ALBUM" ]; then
               TMPL="out/$ALBUM/%(title).100B [%(id)s].%(ext)s"
             fi
-            if   run_ytdlp "$TMPL" $COOKIE_ARGS --extractor-args "$IMP"; then :
+            if   run_ytdlp "$TMPL" $COOKIE_ARGS; then :
             elif { sleep 2; run_ytdlp "$TMPL" $COOKIE_ARGS --extractor-args "$ALT"; }; then :
             elif { sleep 2; run_ytdlp "$TMPL" $COOKIE_ARGS --impersonate chrome; }; then :
             else
