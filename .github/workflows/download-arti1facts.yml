@@ -20,7 +20,7 @@ on:
       mode:
         description: 'video (single item) | collection (whole channel/playlist, zipped) | list (several explicit URLs, batched + zipped)'
         required: false
-        default: 'video'
+        default: 'collection'
         type: string
       urls:
         description: 'list mode only: JSON array of URLs to download together, batched across jobs and zipped'
@@ -62,12 +62,6 @@ jobs:
         run: |
           python -m pip install --quiet --upgrade pip
           python -m pip install --quiet --upgrade yt-dlp cryptography imageio-ffmpeg curl_cffi
-          if command -v zip >/dev/null 2>&1; then
-            :
-          else
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq zip
-          fi
           if command -v ffmpeg >/dev/null 2>&1; then
             FFMPEG_BIN=$(command -v ffmpeg)
           else
@@ -89,20 +83,16 @@ jobs:
           python - <<'PY'
           import base64, os, sys
           from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+          blob = base64.b64decode(os.environ["COOKIES_ENC"])
+          key = bytes.fromhex(os.environ["COOKIE_KEY"].strip())
+          iv, ct = blob[:12], blob[12:]
           try:
-              key = bytes.fromhex(os.environ["COOKIE_KEY"].strip())
-              blob = base64.b64decode(os.environ["COOKIES_ENC"])
-              iv, ct = blob[:12], blob[12:]
               data = AESGCM(key).decrypt(iv, ct, None)
-              with open("cookies.txt", "wb") as f:
-                  f.write(data)
-              print("Cookies decrypted successfully.")
-          except ValueError:
-              print("::error::COOKIE_KEY secret is not a valid 64-character hex string.")
+          except Exception:
+              print("::error::cookie decryption failed")
               sys.exit(1)
-          except Exception as e:
-              print(f"::error::cookie decryption failed: {e}")
-              sys.exit(1)
+          with open("cookies.txt", "wb") as f:
+              f.write(data)
           PY
 
       - name: Download
@@ -129,27 +119,20 @@ jobs:
             yt-dlp \
               $FMT_ARGS $PROXY_ARGS "$@" \
               --no-playlist --no-progress --newline \
-              --retries 5 --fragment-retries 10 \
-              --sleep-requests 1 \
+              --retries 3 --fragment-retries 10 \
               --embed-metadata \
-              --remote-components ejs:github \
               --ffmpeg-location "$FFMPEG_BIN" \
               -o "out/%(title).120B [%(id)s].%(ext)s" \
               -- "$TARGET_URL"
           }
 
-          MWEB_OPT="youtube:player_client=mweb,web"
           IMP="generic:impersonate"
           ALT="youtube:player_client=default,tv,web_safari,mweb"
-
-          if run_ytdlp $COOKIE_ARGS --extractor-args "$MWEB_OPT"; then :
-          elif run_ytdlp $COOKIE_ARGS --extractor-args "$IMP"; then :
-          elif run_ytdlp $COOKIE_ARGS --extractor-args "$ALT"; then :
-          elif run_ytdlp $COOKIE_ARGS --impersonate chrome; then :
-          elif run_ytdlp --extractor-args "$MWEB_OPT"; then :
+          if run_ytdlp $COOKIE_ARGS --extractor-args "$IMP"; then :
+          elif { sleep 2; run_ytdlp $COOKIE_ARGS --extractor-args "$ALT"; }; then :
+          elif { sleep 2; run_ytdlp $COOKIE_ARGS --impersonate chrome; }; then :
           else
             echo "::error::Download failed for $TARGET_URL"
-            exit 1
           fi
           rm -f cookies.txt
 
@@ -202,24 +185,24 @@ jobs:
           TARGET_URL = os.environ["TARGET_URL"]
           MODE = os.environ.get("MODE", "collection")
           MAX_ITEMS = 2000
-          CONCURRENCY = 20
-          MAX_BATCH = 40
+          CONCURRENCY = 10
+          MAX_BATCH = 50
 
           cookies_path = None
           cookies_enc = os.environ.get("COOKIES_ENC", "")
           cookie_key = os.environ.get("COOKIE_KEY", "")
           if cookies_enc and cookie_key:
               from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+              blob = base64.b64decode(cookies_enc)
+              key = bytes.fromhex(cookie_key.strip())
+              iv, ct = blob[:12], blob[12:]
               try:
-                  blob = base64.b64decode(cookies_enc)
-                  key = bytes.fromhex(cookie_key.strip())
-                  iv, ct = blob[:12], blob[12:]
                   data = AESGCM(key).decrypt(iv, ct, None)
                   with open("cookies.txt", "wb") as f:
                       f.write(data)
                   cookies_path = "cookies.txt"
-              except Exception as e:
-                  print(f"::error::cookie decryption failed: {e}")
+              except Exception:
+                  print("::error::cookie decryption failed")
                   sys.exit(1)
 
           def safe_name(name, limit=100):
@@ -319,15 +302,6 @@ jobs:
               def channel_tab(tab):
                   return urlunsplit((parts.scheme or "https", netloc, base.rstrip("/") + "/" + tab, "", ""))
 
-              try:
-                  pl_info = flat_list(channel_tab("playlists"))
-                  for e in pl_info.get("entries") or []:
-                      if e and e.get("id"):
-                          pl_videos = flat_list(f"https://www.youtube.com/playlist?list={e['id']}")
-                          add_entries(pl_videos.get("entries"), safe_name(e.get("title") or e["id"]))
-              except Exception:
-                  pass
-
               for tab in ("videos", "shorts", "streams"):
                   try:
                       add_entries(flat_list(channel_tab(tab)).get("entries"), "")
@@ -348,11 +322,11 @@ jobs:
     if: inputs.mode == 'collection' || inputs.mode == 'list'
     needs: enumerate
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
     continue-on-error: true
     strategy:
       fail-fast: false
-      max-parallel: 20 # 20 שרתים במקביל כפי שביקשת
+      max-parallel: 2 # הוגבל ל-2 במקביל כדי למנוע חסימת קצב מיוטיוב
       matrix:
         batch: ${{ fromJson(needs.enumerate.outputs.batches) }}
     name: download-item ${{ matrix.batch.i }}
@@ -370,12 +344,6 @@ jobs:
         run: |
           python -m pip install --quiet --upgrade pip
           python -m pip install --quiet --upgrade yt-dlp cryptography imageio-ffmpeg curl_cffi
-          if command -v zip >/dev/null 2>&1; then
-            :
-          else
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq zip
-          fi
           if command -v ffmpeg >/dev/null 2>&1; then
             FFMPEG_BIN=$(command -v ffmpeg)
           else
@@ -397,20 +365,16 @@ jobs:
           python - <<'PY'
           import base64, os, sys
           from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+          blob = base64.b64decode(os.environ["COOKIES_ENC"])
+          key = bytes.fromhex(os.environ["COOKIE_KEY"].strip())
+          iv, ct = blob[:12], blob[12:]
           try:
-              key = bytes.fromhex(os.environ["COOKIE_KEY"].strip())
-              blob = base64.b64decode(os.environ["COOKIES_ENC"])
-              iv, ct = blob[:12], blob[12:]
               data = AESGCM(key).decrypt(iv, ct, None)
-              with open("cookies.txt", "wb") as f:
-                  f.write(data)
-              print("Cookies decrypted successfully.")
-          except ValueError:
-              print("::error::COOKIE_KEY secret is not a valid 64-character hex string.")
+          except Exception:
+              print("::error::cookie decryption failed")
               sys.exit(1)
-          except Exception as e:
-              print(f"::error::cookie decryption failed: {e}")
-              sys.exit(1)
+          with open("cookies.txt", "wb") as f:
+              f.write(data)
           PY
 
       - name: Download batch
@@ -444,39 +408,31 @@ jobs:
             yt-dlp \
               $FMT_ARGS $PROXY_ARGS "$@" \
               --no-playlist --no-progress --newline \
-              --retries 5 --fragment-retries 10 \
-              --sleep-requests 1 \
+              --retries 3 --fragment-retries 10 \
+              --sleep-requests 1.5 \
               --embed-metadata \
-              --remote-components ejs:github \
               --ffmpeg-location "$FFMPEG_BIN" \
               -o "$tmpl" \
               -- "$URL"
           }
 
-          MWEB_OPT="youtube:player_client=mweb,web"
           IMP="generic:impersonate"
           ALT="youtube:player_client=default,tv,web_safari,mweb"
-
           while IFS=$'\t' read -r URL ALBUM; do
             [ -z "$URL" ] && continue
+            TMPL="out/%(title).100B [%(id)s].%(ext)s"
             if [ -n "$ALBUM" ]; then
               TMPL="out/$ALBUM/%(title).100B [%(id)s].%(ext)s"
-            else
-              TMPL="out/%(title).100B [%(id)s].%(ext)s"
             fi
-
-            if   run_ytdlp "$TMPL" $COOKIE_ARGS --extractor-args "$MWEB_OPT"; then :
-            elif run_ytdlp "$TMPL" $COOKIE_ARGS --extractor-args "$IMP"; then :
-            elif run_ytdlp "$TMPL" $COOKIE_ARGS --extractor-args "$ALT"; then :
-            elif run_ytdlp "$TMPL" $COOKIE_ARGS --impersonate chrome; then :
-            elif run_ytdlp "$TMPL" --extractor-args "$MWEB_OPT"; then :
+            if   run_ytdlp "$TMPL" $COOKIE_ARGS --extractor-args "$IMP"; then :
+            elif { sleep 2; run_ytdlp "$TMPL" $COOKIE_ARGS --extractor-args "$ALT"; }; then :
+            elif { sleep 2; run_ytdlp "$TMPL" $COOKIE_ARGS --impersonate chrome; }; then :
             else
               echo "::error::Failed to download video: $URL"
             fi
-
-            # השהייה קלה כדי שלא לקבל חסימת Rate Limit מהירה
-            sleep $(( 3 + RANDOM % 4 ))
-
+            
+            # השהייה של 3 שניות בין סרטון לסרטון למניעת Rate Limit
+            sleep 3
           done < batch.tsv
           rm -f batch.tsv cookies.txt
 
