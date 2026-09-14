@@ -1,5 +1,5 @@
-name: Sports Video Downloader
-run-name: sports-${{ inputs.request_id || github.run_id }}
+name:  Video Downloader
+run-name: -${{ inputs.request_id || github.run_id }}
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ on:
         default: 'sports-pack'
         type: string
       url:
-        description: 'קישור למשחק/תקציר (וואן / ספורט 5 / צרלטון / וואלה / אתר משחקים)'
+        description: 'קישור למשחק/תקציר ()'
         required: true
         type: string
       quality:
@@ -64,7 +64,7 @@ jobs:
 
           echo "Starting download for: $TARGET_URL"
 
-          # yt-dlp עם התאמות מיוחדות לדפדפנים ואתרי ספורט ישראליים
+          # yt-dlp עם התאמות מיוחדות לדפדפנים ואתרי  ישראליים
           yt-dlp \
             $FMT_ARGS \
             --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
