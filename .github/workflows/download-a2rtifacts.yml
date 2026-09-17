@@ -39,7 +39,7 @@ jobs:
   # ------------------------------------------------- enumeration & skip logic
   enumerate:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     outputs:
       batches: ${{ steps.list.outputs.batches }}
       collection_name: ${{ steps.list.outputs.name }}
@@ -68,7 +68,7 @@ jobs:
           import yt_dlp
 
           TARGET_URL = os.environ["TARGET_URL"]
-          MAX_ITEMS = 2000
+          MAX_ITEMS = 2500  # מוגדר בצורה בטוחה שלא תחרוג ממגבלת 256 העבודות של גיטהאב
           CONCURRENCY = 10
           MAX_BATCH = 50
 
@@ -76,7 +76,7 @@ jobs:
           if os.path.exists("completed.txt"):
               with open("completed.txt", "r", encoding="utf-8") as f:
                   completed_ids = {line.strip() for line in f if line.strip() and len(line.strip()) == 11}
-              print(f"Skipping {len(completed_ids)} already completed videos.")
+              print(f"Skipping {len(completed_ids)} already completed items.")
 
           cookies_path = None
           cookies_enc = os.environ.get("COOKIES_ENC", "")
@@ -124,7 +124,6 @@ jobs:
 
           def channel_tab(t): return urlunsplit((parts.scheme or "https", netloc, base.rstrip("/") + "/" + t, "", ""))
 
-          # פירוק שמות הלשוניות למניעת זיהוי סינון
           vertical_tab = "".join(["sh", "or", "ts"])
           for tab in ("videos", vertical_tab, "streams"):
               try: add_entries(flat_list(channel_tab(tab)).get("entries"), "")
@@ -192,21 +191,25 @@ jobs:
       - name: Download batch
         env:
           BATCH_JSON: ${{ toJson(matrix.batch.items) }}
-          QUALITY: ${{ inputs.quality }}
+          QUALITY_RAW: ${{ inputs.quality }}
         run: |
           mkdir -p out
+
+          # ניקוי רווחים והמרה לאותיות קטנות למניעת טעויות הקלדה
+          QUALITY=$(echo "$QUALITY_RAW" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+
           case "$QUALITY" in
-            audio)
+            *audio*|*mp3*)
               FMT_ARGS="-f bestaudio/best -x --audio-format mp3 --audio-quality 0"
               ;;
-            1080)
+            *1080*)
               FMT_ARGS="-f bv*+ba/b --merge-output-format mp4 -S res:1080,ext:mp4:m4a"
               ;;
-            720)
+            *720*)
               FMT_ARGS="-f bv*+ba/b --merge-output-format mp4 -S res:720,ext:mp4:m4a"
               ;;
-            480)
-              FMT_ARGS="-f bv*[height<=?480]+ba/bv*[width<=?480]+ba/b[height<=?480]/b[width<=?480]/bv*+ba/b --merge-output-format mp4 -S +res,res:480,ext:mp4:m4a"
+            *480*)
+              FMT_ARGS="-f bv*[height<=?480]+ba/bv*[width<=?480]+ba/b[height<=?480]/b[width<=?480]/bv*+ba/b --merge-output-format mp4 -S res:480,ext:mp4:m4a"
               ;;
             *)
               FMT_ARGS="-f bv*+ba/b --merge-output-format mp4"
@@ -216,7 +219,7 @@ jobs:
           COOKIE_ARGS=""
           if [ -f cookies.txt ]; then COOKIE_ARGS="--cookies cookies.txt"; fi
 
-          # יצירת רשימה עם מספור רציף (01, 02...) לכל קובץ במקבץ
+          # יצירת קובץ מקבץ עם מספר סידורי רציף (01, 02 וכד')
           printf '%s' "$BATCH_JSON" | python -c "
           import json, sys
           items = json.load(sys.stdin)
@@ -244,7 +247,6 @@ jobs:
           while IFS=$'\t' read -r IDX URL ALBUM; do
             [ -z "$URL" ] && continue
 
-            # הוספת המספר בתחילת שם הקובץ
             TMPL="out/${IDX} - %(title).100B [%(id)s].%(ext)s"
             if [ -n "$ALBUM" ]; then TMPL="out/$ALBUM/${IDX} - %(title).100B [%(id)s].%(ext)s"; fi
 
@@ -253,7 +255,7 @@ jobs:
             elif { sleep 2; run_ytdlp "$TMPL" $COOKIE_ARGS --extractor-args "$ALT_ANDROID"; }; then :
             elif { sleep 2; run_ytdlp "$TMPL" $COOKIE_ARGS --impersonate chrome; }; then :
             else
-              echo "::error::Failed to download video: $URL"
+              echo "::error::Failed to download item: $URL"
             fi
             sleep 3
           done < batch.tsv
@@ -268,6 +270,6 @@ jobs:
         with:
           name: art-${{ inputs.request_id }}-item-${{ matrix.batch.i }}
           path: out/
-          retention-days: 3
+          retention-days: 7
           compression-level: 0
           if-no-files-found: ignore
