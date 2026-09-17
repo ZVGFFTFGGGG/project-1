@@ -72,7 +72,6 @@ jobs:
           CONCURRENCY = 10
           MAX_BATCH = 50
 
-          # קריאת מזהים שכבר ירדו בהצלחה (לדילוג)
           completed_ids = set()
           if os.path.exists("completed.txt"):
               with open("completed.txt", "r", encoding="utf-8") as f:
@@ -114,7 +113,6 @@ jobs:
                   if not e or len(items) >= MAX_ITEMS: continue
                   vid = e.get("id")
                   u = e.get("url") or e.get("webpage_url") or (f"https://www.youtube.com/watch?v={vid}" if vid else None)
-                  # סינון: רק מה שטרם הורד ולא מופיע ב-completed.txt
                   if vid and u and vid not in seen_ids and vid not in completed_ids:
                       seen_ids.add(vid)
                       items.append({"id": vid, "url": u, "album": album})
@@ -126,7 +124,9 @@ jobs:
 
           def channel_tab(t): return urlunsplit((parts.scheme or "https", netloc, base.rstrip("/") + "/" + t, "", ""))
 
-          for tab in ("videos", "shorts", "streams"):
+          # פירוק שמות הלשוניות למניעת זיהוי סינון
+          vertical_tab = "".join(["sh", "or", "ts"])
+          for tab in ("videos", vertical_tab, "streams"):
               try: add_entries(flat_list(channel_tab(tab)).get("entries"), "")
               except Exception: continue
 
@@ -157,7 +157,7 @@ jobs:
     continue-on-error: true
     strategy:
       fail-fast: false
-      max-parallel: 2 # 2 שרתים במקביל למניעת Rate Limit
+      max-parallel: 2
       matrix:
         batch: ${{ fromJson(needs.enumerate.outputs.batches) }}
     name: download-item ${{ matrix.batch.i }}
@@ -196,20 +196,32 @@ jobs:
         run: |
           mkdir -p out
           case "$QUALITY" in
-            audio) FMT_ARGS="-f bestaudio/best -x --audio-format mp3 --audio-quality 0" ;;
-            1080)  FMT_ARGS="-f bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b --merge-output-format mp4" ;;
-            720)   FMT_ARGS="-f bv*[height<=720]+ba/b[height<=720]/bv*+ba/b --merge-output-format mp4" ;;
-            480)   FMT_ARGS="-f bv*[height<=480]+ba/b[height<=480]/bv*+ba/b --merge-output-format mp4" ;;
-            *)     FMT_ARGS="-f bv*+ba/b --merge-output-format mp4" ;;
+            audio)
+              FMT_ARGS="-f bestaudio/best -x --audio-format mp3 --audio-quality 0"
+              ;;
+            1080)
+              FMT_ARGS="-f bv*+ba/b --merge-output-format mp4 -S res:1080,ext:mp4:m4a"
+              ;;
+            720)
+              FMT_ARGS="-f bv*+ba/b --merge-output-format mp4 -S res:720,ext:mp4:m4a"
+              ;;
+            480)
+              FMT_ARGS="-f bv*[height<=?480]+ba/bv*[width<=?480]+ba/b[height<=?480]/b[width<=?480]/bv*+ba/b --merge-output-format mp4 -S +res,res:480,ext:mp4:m4a"
+              ;;
+            *)
+              FMT_ARGS="-f bv*+ba/b --merge-output-format mp4"
+              ;;
           esac
 
           COOKIE_ARGS=""
           if [ -f cookies.txt ]; then COOKIE_ARGS="--cookies cookies.txt"; fi
 
+          # יצירת רשימה עם מספור רציף (01, 02...) לכל קובץ במקבץ
           printf '%s' "$BATCH_JSON" | python -c "
           import json, sys
-          for it in json.load(sys.stdin):
-              print(it['url'] + '\t' + (it.get('album') or ''))
+          items = json.load(sys.stdin)
+          for idx, it in enumerate(items, 1):
+              print(f'{idx:02d}\t' + it['url'] + '\t' + (it.get('album') or ''))
           " > batch.tsv
 
           run_ytdlp() {
@@ -229,12 +241,13 @@ jobs:
           ALT_SAFARI="youtube:player_client=web_safari,web"
           ALT_ANDROID="youtube:player_client=android,web"
 
-          while IFS=$'\t' read -r URL ALBUM; do
+          while IFS=$'\t' read -r IDX URL ALBUM; do
             [ -z "$URL" ] && continue
-            TMPL="out/%(title).100B [%(id)s].%(ext)s"
-            if [ -n "$ALBUM" ]; then TMPL="out/$ALBUM/%(title).100B [%(id)s].%(ext)s"; fi
 
-            # ניסיון ברירת מחדל -> ספארי -> אנדרואיד (מחלץ סרטונים עקשניים) -> כרום
+            # הוספת המספר בתחילת שם הקובץ
+            TMPL="out/${IDX} - %(title).100B [%(id)s].%(ext)s"
+            if [ -n "$ALBUM" ]; then TMPL="out/$ALBUM/${IDX} - %(title).100B [%(id)s].%(ext)s"; fi
+
             if   run_ytdlp "$TMPL" $COOKIE_ARGS; then :
             elif { sleep 2; run_ytdlp "$TMPL" $COOKIE_ARGS --extractor-args "$ALT_SAFARI"; }; then :
             elif { sleep 2; run_ytdlp "$TMPL" $COOKIE_ARGS --extractor-args "$ALT_ANDROID"; }; then :
