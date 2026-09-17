@@ -266,6 +266,7 @@ jobs:
         run: rm -f cookies.txt
 
       - name: Upload batch artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: art-${{ inputs.request_id }}-item-${{ matrix.batch.i }}
