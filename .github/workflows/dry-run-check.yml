@@ -1,0 +1,161 @@
+name: dry-run-check
+run-name: check-${{ inputs.request_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: 'מזהה הרצה'
+        required: true
+        type: string
+        default: 'run-01'
+      url:
+        description: 'כתובת המקור לבדיקה'
+        required: true
+        type: string
+      target_count:
+        description: 'כמות מבוקשת לאיתור'
+        required: false
+        default: '1500'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: בדיקת תקינות מזהה
+        run: |
+          case "${{ inputs.request_id }}" in
+            *[!a-zA-Z0-9-]*|"") echo "::error::המזהה חייב לכלול תווים באנגלית או מספרים בלבד"; exit 1;;
+          esac
+
+      - name: קריאת רשימה מקומית
+        uses: actions/checkout@v4
+
+      - name: התקנת רכיב בדיקה
+        run: |
+          python -m pip install --quiet --upgrade pip yt-dlp
+
+      - name: ביצוע בדיקה והפקת נתונים מספריים
+        env:
+          TARGET_URL: ${{ inputs.url }}
+          TARGET_COUNT: ${{ inputs.target_count }}
+        run: |
+          python - <<'PY'
+          import os, re, sys
+          import yt_dlp
+
+          TARGET_URL = os.environ["TARGET_URL"]
+          try:
+              MAX_ITEMS = int(os.environ.get("TARGET_COUNT", "1500").strip())
+          except Exception:
+              MAX_ITEMS = 1500
+
+          # 1. קריאת מזהים קיימים מהקובץ המקומי
+          completed_ids = set()
+          if os.path.exists("completed.txt"):
+              with open("completed.txt", "r", encoding="utf-8") as f:
+                  completed_ids = {line.strip() for line in f if line.strip() and len(line.strip()) == 11}
+
+          # 2. איתור כתובת המאגר המלאה (ללא שאיבת כותרות או שמות)
+          init_opts = {
+              "extract_flat": True,
+              "quiet": True,
+              "no_warnings": True,
+              "skip_download": True,
+              "playlistend": 1,
+          }
+
+          with yt_dlp.YoutubeDL(init_opts) as ydl:
+              meta = ydl.extract_info(TARGET_URL, download=False) or {}
+
+          # חילוץ מזהה מקור בלבד (קוד טכני בלבד)
+          channel_id = meta.get("channel_id") or ""
+          if not (channel_id.startswith("UC") and len(channel_id) == 24):
+              cid = meta.get("id") or ""
+              if cid.startswith("UC") and len(cid) == 24:
+                  channel_id = cid
+          if not channel_id:
+              m = re.search(r'UC[a-zA-Z0-9_-]{22}', str(meta))
+              if m:
+                  channel_id = m.group(0)
+
+          if channel_id and channel_id.startswith("UC"):
+              full_source_url = f"https://www.youtube.com/playlist?list=UU{channel_id[2:]}"
+          else:
+              full_source_url = TARGET_URL
+
+          # 3. סריקה טכנית של מזהים בלבד
+          scan_opts = {
+              "extract_flat": True,
+              "quiet": True,
+              "no_warnings": True,
+              "skip_download": True,
+          }
+
+          found_ids = []
+          total_scanned = 0
+          skipped_count = 0
+          seen = set()
+
+          with yt_dlp.YoutubeDL(scan_opts) as ydl:
+              res = ydl.extract_info(full_source_url, download=False) or {}
+
+          entries = res.get("entries") or []
+          for e in entries:
+              if not e:
+                  continue
+              total_scanned += 1
+              vid = e.get("id")
+
+              if not vid or vid in seen:
+                  continue
+
+              seen.add(vid)
+
+              if vid in completed_ids:
+                  skipped_count += 1
+                  continue
+
+              found_ids.append(vid)
+
+              if len(found_ids) >= MAX_ITEMS:
+                  break
+
+          # 4. הפקת דוח מספרי בלבד (ללא שמות, כותרות או מילים רגישות)
+          report = []
+          report.append("=========================================")
+          report.append("         דוח בדיקה טכני - נתונים בלבד    ")
+          report.append("=========================================")
+          report.append(f"מצב תקשורת: תקין")
+          report.append(f"כמות פריטים רשומים בקובץ קיים: {len(completed_ids)}")
+          report.append(f"סך כל פריטים שנבדקו ברצף: {total_scanned}")
+          report.append(f"פריטים שכבר קיימים ברשימה (דולגו): {skipped_count}")
+          report.append(f"פריטים חדשים שזוהו ומוכנים לעבודה: {len(found_ids)}")
+          report.append(f"יעד שהוגדר לבדיקה: {MAX_ITEMS}")
+          report.append("-----------------------------------------")
+          if len(found_ids) >= MAX_ITEMS:
+              report.append(f"תוצאה: היעד הושג במלואו (נמצאו {len(found_ids)} פריטים חדשים מעבר לקיים).")
+          else:
+              report.append(f"תוצאה: הסריקה הסתיימה. נמצאו {len(found_ids)} פריטים חדשים בסך הכל.")
+          report.append("=========================================")
+
+          output_text = "\n".join(report)
+          print(output_text)
+
+          # כתיבת הסיכום המספרי ללשונית הסיכום בגיטהאב
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_path:
+              with open(summary_path, "a", encoding="utf-8") as f:
+                  f.write("### סיכום נתונים טכני\n\n")
+                  f.write(f"- **מצב חיבור:** תקין\n")
+                  f.write(f"- **רשומים בקובץ קיים:** {len(completed_ids):,}\n")
+                  f.write(f"- **פריטים שנבדקו ברצף:** {total_scanned:,}\n")
+                  f.write(f"- **פריטים שדולגו (כבר קיימים):** {skipped_count:,}\n")
+                  f.write(f"- **פריטים חדשים שזוהו כעת:** {len(found_ids):,}\n")
+                  f.write(f"- **יעד מבוקש:** {MAX_ITEMS:,}\n")
+          PY
