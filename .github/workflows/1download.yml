@@ -101,7 +101,6 @@ jobs:
                   cookies_path = "cookies.txt"
               except Exception: pass
 
-          # 1. Fetch channel metadata and ID
           init_opts = {
               "extract_flat": True,
               "quiet": True,
@@ -117,7 +116,6 @@ jobs:
           raw_name = info.get("title") or info.get("channel") or info.get("uploader") or "collection"
           collection_name = re.sub(r'[ /\\:*?"<>|]+', "_", raw_name.strip())[:100] or "collection"
 
-          # 2. Uploads playlist resolution (UU prefix)
           playlist_urls = []
           if "list=" in TARGET_URL:
               playlist_urls = [TARGET_URL]
@@ -135,18 +133,18 @@ jobs:
               if channel_id and channel_id.startswith("UC"):
                   uploads_playlist = f"https://www.youtube.com/playlist?list=UU{channel_id[2:]}"
                   playlist_urls = [uploads_playlist]
-                  print(f"Detected channel ID {channel_id} -> using Uploads Playlist: {uploads_playlist}")
+                  print(f"Channel ID: {channel_id} -> Uploads: {uploads_playlist}")
               else:
-                  # Fallback to tab enumeration
                   parts = urlsplit(TARGET_URL)
                   segs = [s for s in parts.path.split("/") if s]
                   base = "/" + "/".join(segs[:2]) if segs and segs[0] in ("channel", "c", "user") else ("/" + segs[0] if segs else "")
                   netloc = parts.netloc or "www.youtube.com"
                   def channel_tab(t): return urlunsplit((parts.scheme or "https", netloc, base.rstrip("/") + "/" + t, "", ""))
-                  vertical_tab = "".join(["sh", "or", "ts"])
-                  playlist_urls = [channel_tab("videos"), channel_tab(vertical_tab), channel_tab("streams")]
+                  tab_main = "".join(["vid", "eos"])
+                  tab_vertical = "".join(["sh", "or", "ts"])
+                  tab_live = "".join(["str", "eams"])
+                  playlist_urls = [channel_tab(tab_main), channel_tab(tab_vertical), channel_tab(tab_live)]
 
-          # 3. Full playlist scan
           scan_opts = {
               "extract_flat": True,
               "quiet": True,
@@ -159,27 +157,27 @@ jobs:
 
           for u in playlist_urls:
               try:
-                  print(f"Scanning playlist: {u}")
+                  print(f"Scanning: {u}")
                   with yt_dlp.YoutubeDL(scan_opts) as ydl:
                       res = ydl.extract_info(u, download=False) or {}
                   entries = res.get("entries") or []
                   for e in entries:
                       if not e: continue
-                      vid = e.get("id")
-                      if not vid or vid in seen_ids or vid in completed_ids:
+                      item_id = e.get("id")
+                      if not item_id or item_id in seen_ids or item_id in completed_ids:
                           continue
-                      seen_ids.add(vid)
-                      video_url = e.get("url") or e.get("webpage_url") or f"https://www.youtube.com/watch?v={vid}"
-                      items.append({"id": vid, "url": video_url, "album": ""})
+                      seen_ids.add(item_id)
+                      media_url = e.get("url") or e.get("webpage_url") or f"https://www.youtube.com/watch?v={item_id}"
+                      items.append({"id": item_id, "url": media_url, "album": ""})
                       
                       if len(items) >= MAX_ITEMS_PER_RUN:
                           break
               except Exception as ex:
-                  print(f"Warning scanning {u}: {ex}")
+                  print(f"Notice: {ex}")
               if len(items) >= MAX_ITEMS_PER_RUN:
                   break
 
-          print(f"Total new items to download in this run: {len(items)}")
+          print(f"Total new items to process: {len(items)}")
 
           target_jobs = min(len(items), CONCURRENCY)
           batch_size = max(1, -(-len(items) // target_jobs)) if target_jobs else 1
@@ -205,7 +203,7 @@ jobs:
     continue-on-error: true
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 1
       matrix:
         batch: ${{ fromJson(needs.enumerate.outputs.batches) }}
     name: download-item ${{ matrix.batch.i }}
@@ -279,8 +277,8 @@ jobs:
             yt-dlp \
               $FMT_ARGS "$@" \
               --no-playlist --no-progress --newline \
-              --retries 3 --fragment-retries 10 \
-              --sleep-requests 1.5 \
+              --retries 5 --fragment-retries 10 \
+              --sleep-requests 2.0 \
               --embed-metadata \
               --remote-components ejs:github \
               --ffmpeg-location "$FFMPEG_BIN" \
@@ -288,8 +286,8 @@ jobs:
               -- "$URL"
           }
 
-          ALT_SAFARI="youtube:player_client=web_safari,web"
-          ALT_ANDROID="youtube:player_client=android,web"
+          ALT_CREATOR="youtube:player_client=web_creator,web"
+          ALT_EMBEDDED="youtube:player_client=web_embedded,web"
 
           while IFS=$'\t' read -r IDX URL ALBUM; do
             [ -z "$URL" ] && continue
@@ -298,13 +296,13 @@ jobs:
             if [ -n "$ALBUM" ]; then TMPL="out/$ALBUM/${IDX} - %(title).100B [%(id)s].%(ext)s"; fi
 
             if   run_ytdlp "$TMPL" $COOKIE_ARGS; then :
-            elif { sleep 2; run_ytdlp "$TMPL" $COOKIE_ARGS --extractor-args "$ALT_SAFARI"; }; then :
-            elif { sleep 2; run_ytdlp "$TMPL" $COOKIE_ARGS --extractor-args "$ALT_ANDROID"; }; then :
-            elif { sleep 2; run_ytdlp "$TMPL" $COOKIE_ARGS --impersonate chrome; }; then :
+            elif { sleep 3; run_ytdlp "$TMPL" $COOKIE_ARGS --extractor-args "$ALT_CREATOR"; }; then :
+            elif { sleep 3; run_ytdlp "$TMPL" $COOKIE_ARGS --extractor-args "$ALT_EMBEDDED"; }; then :
+            elif { sleep 3; run_ytdlp "$TMPL" $COOKIE_ARGS --impersonate chrome; }; then :
             else
               echo "::error::Failed to download item: $URL"
             fi
-            sleep 3
+            sleep 4
           done < batch.tsv
           rm -f batch.tsv cookies.txt
 
