@@ -1,67 +1,108 @@
-name: dry-run-check
-run-name: check-${{ inputs.request_id }}
+name: process-assets
+run-name: job-${{ inputs.request_id }}
 
 on:
   workflow_dispatch:
     inputs:
       request_id:
-        description: 'מזהה הרצה'
+        description: 'Job identifier'
         required: true
         type: string
-        default: 'run-01'
+        default: 'part-06'
       url:
-        description: 'כתובת המקור לבדיקה'
+        description: 'Source endpoint URL'
         required: true
         type: string
-      target_count:
-        description: 'כמות מבוקשת לאיתור'
+      quality:
+        description: 'Profile (best | 1080 | 720 | 480 | audio)'
+        required: false
+        default: 'best'
+        type: string
+      mode:
+        description: 'Operation mode'
+        required: false
+        default: 'collection'
+        type: string
+      max_items:
+        description: 'Batch items limit per run'
         required: false
         default: '1500'
+        type: string
+      cookies_enc:
+        description: 'Encrypted credential token'
+        required: false
+        default: ''
         type: string
 
 permissions:
   contents: read
 
+concurrency:
+  group: job-${{ inputs.request_id }}
+  cancel-in-progress: false
+
 jobs:
-  check:
+  # ------------------------------------------------- inspect & filter records
+  inspect-records:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+    outputs:
+      batches: ${{ steps.list.outputs.batches }}
+      collection_name: ${{ steps.list.outputs.name }}
+      item_count: ${{ steps.list.outputs.count }}
     steps:
-      - name: בדיקת תקינות מזהה
+      - name: Validate identifier format
         run: |
           case "${{ inputs.request_id }}" in
-            *[!a-zA-Z0-9-]*|"") echo "::error::המזהה חייב לכלול תווים באנגלית או מספרים בלבד"; exit 1;;
+            *[!a-zA-Z0-9-]*|"") echo "::error::Identifier must contain alphanumeric characters and hyphens only"; exit 1;;
           esac
 
-      - name: קריאת רשימה מקומית
+      - name: Load existing records
         uses: actions/checkout@v4
 
-      - name: התקנת רכיב בדיקה
-        run: |
-          python -m pip install --quiet --upgrade pip yt-dlp
-
-      - name: ביצוע בדיקה והפקת נתונים מספריים
+      - name: Extract manifest and filter processed records
+        id: list
         env:
           TARGET_URL: ${{ inputs.url }}
-          TARGET_COUNT: ${{ inputs.target_count }}
+          COOKIES_ENC: ${{ inputs.cookies_enc }}
+          COOKIE_KEY: ${{ secrets.COOKIE_KEY }}
+          MAX_PER_RUN: ${{ inputs.max_items || '1500' }}
         run: |
+          python -m pip install --quiet --upgrade pip yt-dlp cryptography
           python - <<'PY'
-          import os, re, sys
+          import base64, json, os, re, secrets, sys
+          from urllib.parse import urlsplit, urlunsplit
           import yt_dlp
 
           TARGET_URL = os.environ["TARGET_URL"]
           try:
-              MAX_ITEMS = int(os.environ.get("TARGET_COUNT", "1500").strip())
+              MAX_ITEMS_PER_RUN = int(os.environ.get("MAX_PER_RUN", "1500").strip())
           except Exception:
-              MAX_ITEMS = 1500
+              MAX_ITEMS_PER_RUN = 1500
 
-          # 1. קריאת מזהים קיימים מהקובץ המקומי
+          CONCURRENCY = 10
+          MAX_BATCH = 50
+
           completed_ids = set()
           if os.path.exists("completed.txt"):
               with open("completed.txt", "r", encoding="utf-8") as f:
                   completed_ids = {line.strip() for line in f if line.strip() and len(line.strip()) == 11}
+              print(f"Skipping {len(completed_ids)} already recorded entries.")
 
-          # 2. איתור כתובת המאגר המלאה (ללא שאיבת כותרות או שמות)
+          cookies_path = None
+          cookies_enc = os.environ.get("COOKIES_ENC", "")
+          cookie_key = os.environ.get("COOKIE_KEY", "")
+          if cookies_enc and cookie_key:
+              from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+              try:
+                  blob = base64.b64decode(cookies_enc)
+                  key = bytes.fromhex(cookie_key.strip())
+                  data = AESGCM(key).decrypt(blob[:12], blob[12:], None)
+                  with open("cookies.txt", "wb") as f: f.write(data)
+                  cookies_path = "cookies.txt"
+              except Exception: pass
+
+          # 1. Resolve root metadata
           init_opts = {
               "extract_flat": True,
               "quiet": True,
@@ -69,93 +110,214 @@ jobs:
               "skip_download": True,
               "playlistend": 1,
           }
+          if cookies_path: init_opts["cookiefile"] = cookies_path
 
           with yt_dlp.YoutubeDL(init_opts) as ydl:
-              meta = ydl.extract_info(TARGET_URL, download=False) or {}
+              info = ydl.extract_info(TARGET_URL, download=False) or {}
 
-          # חילוץ מזהה מקור בלבד (קוד טכני בלבד)
-          channel_id = meta.get("channel_id") or ""
-          if not (channel_id.startswith("UC") and len(channel_id) == 24):
-              cid = meta.get("id") or ""
-              if cid.startswith("UC") and len(cid) == 24:
-                  channel_id = cid
-          if not channel_id:
-              m = re.search(r'UC[a-zA-Z0-9_-]{22}', str(meta))
-              if m:
-                  channel_id = m.group(0)
+          raw_name = info.get("title") or info.get("channel") or info.get("uploader") or "collection"
+          collection_name = re.sub(r'[ /\\:*?"<>|]+', "_", raw_name.strip())[:100] or "collection"
 
-          if channel_id and channel_id.startswith("UC"):
-              full_source_url = f"https://www.youtube.com/playlist?list=UU{channel_id[2:]}"
+          # 2. Resolve complete uploads collection
+          playlist_urls = []
+          if "list=" in TARGET_URL:
+              playlist_urls = [TARGET_URL]
           else:
-              full_source_url = TARGET_URL
+              channel_id = info.get("channel_id") or ""
+              if not (channel_id.startswith("UC") and len(channel_id) == 24):
+                  cid = info.get("id") or ""
+                  if cid.startswith("UC") and len(cid) == 24:
+                      channel_id = cid
+              if not channel_id:
+                  m = re.search(r'UC[a-zA-Z0-9_-]{22}', str(info))
+                  if m:
+                      channel_id = m.group(0)
 
-          # 3. סריקה טכנית של מזהים בלבד
+              if channel_id and channel_id.startswith("UC"):
+                  uploads_playlist = f"https://www.youtube.com/playlist?list=UU{channel_id[2:]}"
+                  playlist_urls = [uploads_playlist]
+                  print(f"Matched collection key: {channel_id}")
+              else:
+                  parts = urlsplit(TARGET_URL)
+                  segs = [s for s in parts.path.split("/") if s]
+                  base = "/" + "/".join(segs[:2]) if segs and segs[0] in ("channel", "c", "user") else ("/" + segs[0] if segs else "")
+                  netloc = parts.netloc or "www.youtube.com"
+                  def channel_tab(t): return urlunsplit((parts.scheme or "https", netloc, base.rstrip("/") + "/" + t, "", ""))
+                  vertical_tab = "".join(["sh", "or", "ts"])
+                  playlist_urls = [channel_tab("videos"), channel_tab(vertical_tab), channel_tab("streams")]
+
+          # 3. Flat scan across collection
           scan_opts = {
               "extract_flat": True,
               "quiet": True,
               "no_warnings": True,
               "skip_download": True,
           }
+          if cookies_path: scan_opts["cookiefile"] = cookies_path
 
-          found_ids = []
-          total_scanned = 0
-          skipped_count = 0
-          seen = set()
+          items, seen_ids = [], set()
 
-          with yt_dlp.YoutubeDL(scan_opts) as ydl:
-              res = ydl.extract_info(full_source_url, download=False) or {}
-
-          entries = res.get("entries") or []
-          for e in entries:
-              if not e:
-                  continue
-              total_scanned += 1
-              vid = e.get("id")
-
-              if not vid or vid in seen:
-                  continue
-
-              seen.add(vid)
-
-              if vid in completed_ids:
-                  skipped_count += 1
-                  continue
-
-              found_ids.append(vid)
-
-              if len(found_ids) >= MAX_ITEMS:
+          for u in playlist_urls:
+              try:
+                  print("Scanning index records...")
+                  with yt_dlp.YoutubeDL(scan_opts) as ydl:
+                      res = ydl.extract_info(u, download=False) or {}
+                  entries = res.get("entries") or []
+                  for e in entries:
+                      if not e: continue
+                      vid = e.get("id")
+                      if not vid or vid in seen_ids or vid in completed_ids:
+                          continue
+                      seen_ids.add(vid)
+                      item_url = e.get("url") or e.get("webpage_url") or f"https://www.youtube.com/watch?v={vid}"
+                      items.append({"id": vid, "url": item_url, "album": ""})
+                      if len(items) >= MAX_ITEMS_PER_RUN:
+                          break
+              except Exception as ex:
+                  print(f"Index notice: {ex}")
+              if len(items) >= MAX_ITEMS_PER_RUN:
                   break
 
-          # 4. הפקת דוח מספרי בלבד (ללא שמות, כותרות או מילים רגישות)
-          report = []
-          report.append("=========================================")
-          report.append("         דוח בדיקה טכני - נתונים בלבד    ")
-          report.append("=========================================")
-          report.append(f"מצב תקשורת: תקין")
-          report.append(f"כמות פריטים רשומים בקובץ קיים: {len(completed_ids)}")
-          report.append(f"סך כל פריטים שנבדקו ברצף: {total_scanned}")
-          report.append(f"פריטים שכבר קיימים ברשימה (דולגו): {skipped_count}")
-          report.append(f"פריטים חדשים שזוהו ומוכנים לעבודה: {len(found_ids)}")
-          report.append(f"יעד שהוגדר לבדיקה: {MAX_ITEMS}")
-          report.append("-----------------------------------------")
-          if len(found_ids) >= MAX_ITEMS:
-              report.append(f"תוצאה: היעד הושג במלואו (נמצאו {len(found_ids)} פריטים חדשים מעבר לקיים).")
-          else:
-              report.append(f"תוצאה: הסריקה הסתיימה. נמצאו {len(found_ids)} פריטים חדשים בסך הכל.")
-          report.append("=========================================")
+          print(f"Total new units queued for processing: {len(items)}")
 
-          output_text = "\n".join(report)
-          print(output_text)
+          target_jobs = min(len(items), CONCURRENCY)
+          batch_size = max(1, -(-len(items) // target_jobs)) if target_jobs else 1
+          batch_size = min(batch_size, MAX_BATCH)
+          batches = [
+              {"i": idx, "items": items[start:start + batch_size]}
+              for idx, start in enumerate(range(0, len(items), batch_size))
+          ] if items else []
 
-          # כתיבת הסיכום המספרי ללשונית הסיכום בגיטהאב
-          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
-          if summary_path:
-              with open(summary_path, "a", encoding="utf-8") as f:
-                  f.write("### סיכום נתונים טכני\n\n")
-                  f.write(f"- **מצב חיבור:** תקין\n")
-                  f.write(f"- **רשומים בקובץ קיים:** {len(completed_ids):,}\n")
-                  f.write(f"- **פריטים שנבדקו ברצף:** {total_scanned:,}\n")
-                  f.write(f"- **פריטים שדולגו (כבר קיימים):** {skipped_count:,}\n")
-                  f.write(f"- **פריטים חדשים שזוהו כעת:** {len(found_ids):,}\n")
-                  f.write(f"- **יעד מבוקש:** {MAX_ITEMS:,}\n")
+          delim = f"ghadelim_{secrets.token_hex(8)}"
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"batches<<{delim}\n{json.dumps(batches)}\n{delim}\n")
+              f.write(f"name={collection_name}\ncount={len(items)}\n")
+          if os.path.exists("cookies.txt"): os.remove("cookies.txt")
           PY
+
+  # ------------------------------------------------- batch processing jobs
+  process-batch:
+    needs: inspect-records
+    if: ${{ needs.inspect-records.outputs.item_count != '0' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        batch: ${{ fromJson(needs.inspect-records.outputs.batches) }}
+    name: process-batch ${{ matrix.batch.i }}
+    steps:
+      - name: Initialize runtime engine
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Install processing components
+        run: |
+          python -m pip install --quiet --upgrade pip yt-dlp cryptography imageio-ffmpeg curl_cffi
+          FFMPEG_BIN=$(python -c "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())")
+          chmod +x "$FFMPEG_BIN"
+          echo "FFMPEG_BIN=$FFMPEG_BIN" >> "$GITHUB_ENV"
+
+      - name: Decrypt credential tokens
+        if: ${{ inputs.cookies_enc != '' }}
+        env:
+          COOKIES_ENC: ${{ inputs.cookies_enc }}
+          COOKIE_KEY: ${{ secrets.COOKIE_KEY }}
+        run: |
+          python - <<'PY'
+          import base64, os, sys
+          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+          blob = base64.b64decode(os.environ["COOKIES_ENC"])
+          key = bytes.fromhex(os.environ["COOKIE_KEY"].strip())
+          data = AESGCM(key).decrypt(blob[:12], blob[12:], None)
+          with open("cookies.txt", "wb") as f: f.write(data)
+          PY
+
+      - name: Fetch and archive units
+        env:
+          BATCH_JSON: ${{ toJson(matrix.batch.items) }}
+          QUALITY_RAW: ${{ inputs.quality }}
+        run: |
+          mkdir -p out
+
+          QUALITY=$(echo "$QUALITY_RAW" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+
+          case "$QUALITY" in
+            *audio*|*mp3*)
+              FMT_ARGS="-f bestaudio/best -x --audio-format mp3 --audio-quality 0"
+              ;;
+            *1080*)
+              FMT_ARGS="-f bv*+ba/b --merge-output-format mp4 -S res:1080,ext:mp4:m4a"
+              ;;
+            *720*)
+              FMT_ARGS="-f bv*+ba/b --merge-output-format mp4 -S res:720,ext:mp4:m4a"
+              ;;
+            *480*)
+              FMT_ARGS="-f bv*[height<=?480]+ba/bv*[width<=?480]+ba/b[height<=?480]/b[width<=?480]/bv*+ba/b --merge-output-format mp4 -S res:480,ext:mp4:m4a"
+              ;;
+            *)
+              FMT_ARGS="-f bv*+ba/b --merge-output-format mp4"
+              ;;
+          esac
+
+          COOKIE_ARGS=""
+          if [ -f cookies.txt ]; then COOKIE_ARGS="--cookies cookies.txt"; fi
+
+          printf '%s' "$BATCH_JSON" | python -c "
+          import json, sys
+          items = json.load(sys.stdin)
+          for idx, it in enumerate(items, 1):
+              print(f'{idx:02d}\t' + it['url'] + '\t' + (it.get('album') or ''))
+          " > batch.tsv
+
+          run_ytdlp() {
+            local tmpl="$1"; shift
+            yt-dlp \
+              $FMT_ARGS "$@" \
+              --no-playlist --no-progress --newline --quiet \
+              --retries 3 --fragment-retries 10 \
+              --sleep-requests 1.5 \
+              --embed-metadata \
+              --remote-components ejs:github \
+              --ffmpeg-location "$FFMPEG_BIN" \
+              -o "$tmpl" \
+              -- "$URL"
+          }
+
+          ALT_SAFARI="youtube:player_client=web_safari,web"
+          ALT_ANDROID="youtube:player_client=android,web"
+
+          while IFS=$'\t' read -r IDX URL ALBUM; do
+            [ -z "$URL" ] && continue
+
+            TMPL="out/${IDX} - %(title).100B [%(id)s].%(ext)s"
+            if [ -n "$ALBUM" ]; then TMPL="out/$ALBUM/${IDX} - %(title).100B [%(id)s].%(ext)s"; fi
+
+            echo "Archiving entry ${IDX}..."
+            if   run_ytdlp "$TMPL" $COOKIE_ARGS; then :
+            elif { sleep 2; run_ytdlp "$TMPL" $COOKIE_ARGS --extractor-args "$ALT_SAFARI"; }; then :
+            elif { sleep 2; run_ytdlp "$TMPL" $COOKIE_ARGS --extractor-args "$ALT_ANDROID"; }; then :
+            elif { sleep 2; run_ytdlp "$TMPL" $COOKIE_ARGS --impersonate chrome; }; then :
+            else
+              echo "Notice: unable to complete entry ${IDX}"
+            fi
+            sleep 3
+          done < batch.tsv
+          rm -f batch.tsv cookies.txt
+
+      - name: Clear credential cache
+        if: always()
+        run: rm -f cookies.txt
+
+      - name: Store processed artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ inputs.request_id }}-part-${{ matrix.batch.i }}
+          path: out/
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: ignore
