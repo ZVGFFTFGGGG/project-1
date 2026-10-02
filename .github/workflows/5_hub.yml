@@ -10,12 +10,12 @@ on:
         default: 'domestic_league'
         type: choice
         options:
-          - 'domestic_league'    # ליגת העל בכדורגל
+          - 'domestic_league'    # ליגת העל בכדורגל (תקצירים וכתבות וידאו)
           - 'european_league'    # ליגת האלופות
-          - 'latest_feed'        # כל התקצירים האחרונים
-          - 'query_search'       # חיפוש חופשי
+          - 'latest_feed'        # כל התקצירים האחרונים (VOD ראשי)
+          - 'all_recent'         # כל הווידאו העדכני באתר (חדשות + תקצירים)
       query:
-        description: 'סינון לפי מילת חיפוש (אופציונלי, השאר ריק לכל התקצירים)'
+        description: 'סינון לפי מילת חיפוש (השאר ריק כדי להוריד הכל ללא סינון)'
         required: false
         default: ''
         type: string
@@ -43,7 +43,7 @@ on:
           - '480'
           - 'best'
       proxy_url:
-        description: 'שרת פרוקסי ישראלי (חובה אם מריצים על שרתי חו"ל של GitHub, למשל: http://user:pass@ip:port או socks5://...)'
+        description: 'שרת פרוקסי ישראלי (חובה אם מריצים על שרתי חו"ל של GitHub)'
         required: false
         default: ''
         type: string
@@ -82,12 +82,12 @@ jobs:
           PROXY_URL: ${{ inputs.proxy_url }}
         run: |
           python - <<'PY'
-          import urllib.request, urllib.parse, re, os, sys, html, json, time
+          import urllib.request, urllib.parse, re, os, sys, html, json
           from bs4 import BeautifulSoup
 
           category = os.environ.get("CATEGORY", "domestic_league")
           raw_query = os.environ.get("QUERY", "").strip()
-          
+
           try:
               max_items = int(os.environ.get("SCOPE", "10").strip())
               if max_items <= 0:
@@ -98,25 +98,46 @@ jobs:
           action_type = os.environ.get("ACTION", "download")
           proxy_url = os.environ.get("PROXY_URL", "").strip()
 
-          tag_map = {
-              "domestic_league": "https://www.sport5.co.il/Tags/%D7%9C%D7%99%D7%92%D7%AA_%D7%94%D7%A2%D7%9C_%D7%91%D7%9B%D7%93%D7%95%D7%A8%D7%92%D7%9c",
-              "european_league": "https://www.sport5.co.il/Tags/%D7%9C%D7%99%D7%92%D7%AA_%D7%94%D7%90%D7%9c%D7%95%D7%A4%D7%95%D7%AA",
-              "latest_feed": "https://www.sport5.co.il/Tags/%D7%AA%D7%A7%D7%A6%D7%99%D7%A8%D7%99%D7%9D",
-              "query_search": "https://www.sport5.co.il/Tags/%D7%AA%D7%A7%D7%A6%D7%99%D7%A8%D7%99%D7%9D"
+          # כתובות קטגוריה מדויקות לפי מבנה האתר העדכני
+          sources_map = {
+              "domestic_league": [
+                  "https://www.sport5.co.il/category.aspx?FolderID=44",
+                  "https://vod.sport5.co.il/?Vc=44",
+                  "https://www.sport5.co.il/Tags/%D7%9C%D7%99%D7%92%D7%AA_%D7%94%D7%A2%D7%9C_%D7%91%D7%9B%D7%93%D7%95%D7%A8%D7%92%D7%9c"
+              ],
+              "european_league": [
+                  "https://www.sport5.co.il/category.aspx?FolderID=397",
+                  "https://vod.sport5.co.il/?Vc=397",
+                  "https://www.sport5.co.il/Tags/%D7%9C%D7%99%D7%92%D7%AA_%D7%94%D7%90%D7%9c%D7%95%D7%A4%D7%95%D7%AA"
+              ],
+              "latest_feed": [
+                  "https://vod.sport5.co.il/",
+                  "https://www.sport5.co.il/category.aspx?FolderID=21"
+              ],
+              "all_recent": [
+                  "https://vod.sport5.co.il/",
+                  "https://www.sport5.co.il/sitemap/articles/news-sitemap.xml"
+              ]
           }
 
           aliases = {
-              "barcelona": ["barcelona", "ברצלונה", "בארסה"],
-              "real madrid": ["real madrid", "ריאל מדריד", "ריאל"],
-              "maccabi": ["maccabi", "מכבי"],
-              "haifa": ["haifa", "חיפה"],
-              "tel aviv": ["tel aviv", "תל אביב"]
+              "מכבי תל אביב": ["מכבי ת\"א", "מכבי תל אביב", "תל אביב", "מכבי ת'א"],
+              "מכבי חיפה": ["מכבי חיפה", "חיפה", "ירוקים"],
+              "בית\"ר ירושלים": ["בית\"ר", "ביתר", "ירושלים"],
+              "הפועל באר שבע": ["באר שבע", "ב\"ש", "הפועל ב\"ש"]
           }
 
           q_low = raw_query.lower()
           search_keys = [q_low] if q_low else []
-          if q_low in aliases:
-              search_keys.extend(aliases[q_low])
+          for k, alias_list in aliases.items():
+              if k in q_low or any(a in q_low for a in alias_list):
+                  search_keys.extend(alias_list)
+          search_keys = list(set(search_keys))
+
+          if search_keys:
+              print(f"Filter keywords active: {search_keys}")
+          else:
+              print("No keyword filter specified, collecting all videos in category.")
 
           headers = {
               "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -134,7 +155,6 @@ jobs:
 
           def clean_title(text):
               t = re.sub(r'<!\[CDATA\[(.*?)\]\]>', r'\1', text, flags=re.DOTALL)
-              t = t.replace('<![CDATA[', '').replace(']]>', '')
               t = html.unescape(t).strip()
               t = re.sub(r'[\r\n\t]+', ' ', t)
               t = re.sub(r'[ /\\:*?"<>|]+', '_', t)
@@ -146,20 +166,20 @@ jobs:
               img = a_tag.find("img")
               if img and img.get("alt"):
                   return img["alt"].strip()
-              h = a_tag.find(["h1", "h2", "h3", "h4"])
-              if h and h.get_text(strip=True):
-                  return h.get_text(strip=True)
-              txt = a_tag.get_text(strip=True)
-              return txt if txt else ""
+              for tag in ["h1", "h2", "h3", "h4", "span", "p"]:
+                  h = a_tag.find(tag)
+                  if h and h.get_text(strip=True):
+                      return h.get_text(strip=True)
+              return a_tag.get_text(strip=True)
 
           def extract_clean_stream(page_url):
-              """חילוץ כתובת שידור נקייה m3u8 מעמוד הכתבה או ה-VOD"""
+              """חילוץ ישיר של כתובת ה-m3u8 מהעמוד"""
               try:
                   req = urllib.request.Request(page_url, headers=headers)
                   with opener.open(req, timeout=12) as r:
                       page_html = r.read().decode("utf-8", errors="ignore")
 
-                  # 1. JSON-LD structured data
+                  # 1. JSON-LD VideoObject
                   soup = BeautifulSoup(page_html, "html.parser")
                   for script in soup.find_all("script", type="application/ld+json"):
                       try:
@@ -167,16 +187,16 @@ jobs:
                           items = data if isinstance(data, list) else [data]
                           for item in items:
                               if item.get("@type") == "VideoObject":
-                                  content_url = item.get("contentUrl", "")
-                                  if "src=" in content_url:
-                                      raw = urllib.parse.unquote(content_url.split("src=")[-1])
+                                  c_url = item.get("contentUrl", "")
+                                  if "src=" in c_url:
+                                      raw = urllib.parse.unquote(c_url.split("src=")[-1])
                                       clean = raw.split("&")[0].split("\\u0026")[0].strip()
                                       if ".m3u8" in clean:
                                           return clean.split(".m3u8")[0] + ".m3u8"
                       except Exception:
-                          continue
+                          pass
 
-                  # 2. Player watch.sport5.co.il regex
+                  # 2. Player watch.sport5.co.il
                   match_watch = re.search(r'watch\.sport5\.co\.il/?\?src=([^"\'<>\s]+)', page_html)
                   if match_watch:
                       raw_src = urllib.parse.unquote(match_watch.group(1))
@@ -193,53 +213,54 @@ jobs:
                       clean = decoded.split("___")[0].split("&")[0].strip()
                       if ".m3u8" in clean:
                           return clean.split(".m3u8")[0] + ".m3u8"
-              except Exception as e:
+              except Exception:
                   pass
               return None
 
           candidates = []
           seen_links = set()
 
-          base_target_url = tag_map.get(category, tag_map["domestic_league"])
-          print(f"Scraping category: {category} -> {base_target_url}")
+          target_urls = sources_map.get(category, sources_map["domestic_league"])
 
-          # דפדוף אוטומטי עד להשגת כמות מספקת של קישורים
-          page_num = 1
-          max_pages = max(15, (max_items // 8) + 3)
-
-          while len(candidates) < (max_items * 2) and page_num <= max_pages:
-              url = f"{base_target_url}?Page={page_num}" if page_num > 1 else base_target_url
-              print(f"Fetching page {page_num}: {url}")
-              try:
-                  req = urllib.request.Request(url, headers=headers)
-                  with opener.open(req, timeout=12) as resp:
-                      soup = BeautifulSoup(resp.read().decode("utf-8", errors="ignore"), "html.parser")
-                      new_on_page = 0
-                      for a in soup.find_all("a", href=True):
-                          h = a["href"].strip()
-                          # תמיכה בכתבות וגם בעמודי VOD ישירים
-                          is_article = ("articles.aspx" in h and "docID=" in h.lower())
-                          is_vod = ("vod.sport5.co.il" in h or ("?vc=" in h.lower() and "vi=" in h.lower()))
-
-                          if is_article or is_vod:
-                              full_link = h if h.startswith("http") else f"https://www.sport5.co.il/{h.lstrip('/')}"
-                              full_link = html.unescape(full_link)
-                              if full_link not in seen_links:
-                                  raw_t = extract_link_title(a)
-                                  t = clean_title(raw_t)
-                                  if len(t) >= 4:
-                                      seen_links.add(full_link)
-                                      candidates.append((full_link, t))
-                                      new_on_page += 1
-                      if new_on_page == 0:
-                          print("No more items found on this page. Stopping pagination.")
-                          break
-              except Exception as e:
-                  print(f"Pagination error on page {page_num}: {e}")
+          for target_url in target_urls:
+              if len(candidates) >= (max_items * 3):
                   break
-              page_num += 1
+              print(f"Scanning source: {target_url}")
+              try:
+                  req = urllib.request.Request(target_url, headers=headers)
+                  with opener.open(req, timeout=12) as resp:
+                      content = resp.read().decode("utf-8", errors="ignore")
+                      
+                      # אם זה קובץ XML (sitemap)
+                      if "<urlset" in content:
+                          for block in re.findall(r'<url>(.*?)</url>', content, re.DOTALL):
+                              loc_m = re.search(r'<loc>(.*?)</loc>', block)
+                              title_m = re.search(r'<news:title>(.*?)</news:title>', block) or re.search(r'<title>(.*?)</title>', block)
+                              if loc_m:
+                                  loc = html.unescape(loc_m.group(1).strip())
+                                  title = clean_title(html.unescape(title_m.group(1).strip()) if title_m else "")
+                                  if loc not in seen_links:
+                                      seen_links.add(loc)
+                                      candidates.append((loc, title))
+                      else:
+                          soup = BeautifulSoup(content, "html.parser")
+                          for a in soup.find_all("a", href=True):
+                              h = a["href"].strip()
+                              is_art = "articles.aspx" in h and ("docid=" in h.lower() or "docID=" in h)
+                              is_vod = "vod.sport5.co.il" in h or ("?vc=" in h.lower() and "vi=" in h.lower())
+                              if is_art or is_vod:
+                                  full_link = h if h.startswith("http") else f"https://www.sport5.co.il/{h.lstrip('/')}"
+                                  full_link = html.unescape(full_link)
+                                  if full_link not in seen_links:
+                                      raw_t = extract_link_title(a)
+                                      t = clean_title(raw_t)
+                                      if len(t) >= 4:
+                                          seen_links.add(full_link)
+                                          candidates.append((full_link, t))
+              except Exception as e:
+                  print(f"Note on {target_url}: {e}")
 
-          print(f"Total candidate links gathered across pages: {len(candidates)}")
+          print(f"Total candidate pages gathered: {len(candidates)}")
 
           resolved_items = []
           seen_streams = set()
@@ -248,11 +269,12 @@ jobs:
               if len(resolved_items) >= max_items:
                   break
 
-              # סינון לפי מילת חיפוש אם הוגדרה
+              # בדיקת סינון מילות חיפוש
               if search_keys:
                   t_low = page_title.lower()
                   l_low = loc.lower()
-                  if not any(k in t_low or k in l_low for k in search_keys):
+                  match = any(k in t_low or k in l_low for k in search_keys)
+                  if not match:
                       continue
 
               stream = extract_clean_stream(loc)
@@ -263,14 +285,14 @@ jobs:
                       "title": page_title,
                       "page": loc
                   })
-                  print(f"[{len(resolved_items)}/{max_items}] Located video: {page_title[:50]}")
+                  print(f"[{len(resolved_items)}/{max_items}] Video ready: {page_title[:60]}")
 
-          print(f"\nFinal valid video count: {len(resolved_items)}")
+          print(f"\nFinal catalog size: {len(resolved_items)} videos")
 
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
               summary.write(f"## Sport5 Catalog Summary\n\n")
               summary.write(f"- **Category:** `{category}`\n")
-              summary.write(f"- **Requested Items:** `{max_items}`\n")
+              summary.write(f"- **Filter:** `{raw_query or 'None'}`\n")
               summary.write(f"- **Total Highlights Located:** `{len(resolved_items)}`\n\n")
               summary.write("| # | Highlight Title | Direct Stream |\n")
               summary.write("| :--- | :--- | :--- |\n")
