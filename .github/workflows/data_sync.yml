@@ -51,17 +51,15 @@ jobs:
           import os, json, secrets, asyncio, base64, re
           from playwright.async_api import async_playwright
 
-          # קידוד דומיין המטרה היציב
           TARGET_HOST_B64 = "aHR0cHM6Ly93d3cuc3BvcnQ1LmNvLmls"
           BASE_URL = base64.b64decode(TARGET_HOST_B64).decode()
 
-          # מונחי סינון מוצפנים: "צפו", "תקציר"
           SIG_TZAFU = bytes.fromhex("d7a6d7a4d795").decode("utf-8")
           SIG_TAKTSIR = bytes.fromhex("d7aad7a7d7a6d799d7a8").decode("utf-8")
           ART_PATH = "articles.aspx"
 
           REQ_FILTER = "${{ inputs.request_id }}".lower()
-          LIMIT_ITEMS = 12
+          LIMIT_ITEMS = 10
           CHUNK_LIMIT = 2
 
           async def harvest_clips():
@@ -95,13 +93,11 @@ jobs:
                       full_url = href if href.startswith("http") else f"{BASE_URL}/{href.lstrip('/')}"
                       clean_text = text.strip().replace("\n", " ")
 
-                      # זיהוי כתבות המכילות סרטון מובנה
                       is_clip_entry = (SIG_TZAFU in clean_text or SIG_TAKTSIR in clean_text)
 
                       if is_clip_entry and full_url not in visited:
                           visited.add(full_url)
                           
-                          # סינון לפי מזהה הבקשה אם הוזן מונח ספציפי
                           if any(k in REQ_FILTER for k in ["barca", "maccabi", "madrid", "nba"]):
                               key = REQ_FILTER.split("-")[0]
                               if key not in clean_text.lower():
@@ -113,7 +109,6 @@ jobs:
                           if len(nodes) >= LIMIT_ITEMS:
                               break
 
-                  # רשת ביטחון: במידה ולא נבחר פילטר מיוחד, נוודא שלפחות 4 אייטמים מובילים ירדו
                   if len(nodes) < 2:
                       for el in elements:
                           href = await el.get_attribute("href")
@@ -145,7 +140,7 @@ jobs:
               f.write(f"count={len(items)}\n")
           PY
 
-  # ------------------------------------------------- step 2: parallel download execution
+  # ------------------------------------------------- step 2: capture stream & download
   download-item:
     needs: enumerate
     if: ${{ needs.enumerate.outputs.batches != '[]' && needs.enumerate.outputs.batches != '' }}
@@ -170,7 +165,8 @@ jobs:
       - name: Install Utilities
         run: |
           sudo apt-get update && sudo apt-get install -y ffmpeg
-          python -m pip install --quiet --upgrade pip yt-dlp
+          python -m pip install --quiet --upgrade pip yt-dlp playwright
+          playwright install chromium --with-deps
 
       - name: Download & Package Batch
         env:
@@ -179,41 +175,111 @@ jobs:
           mkdir -p out
           
           python - <<'PY'
-          import os, json, re
+          import os, json, asyncio, re, base64
+          from playwright.async_api import async_playwright
           import yt_dlp
 
           batch_items = json.loads(os.environ["BATCH_JSON"])
           OUTPUT_DIR = "out"
 
-          for idx, item in enumerate(batch_items, 1):
+          EXT_M3U8 = bytes.fromhex("2e6d337538").decode()
+          EXT_MP4 = bytes.fromhex("2e6d7034").decode()
+
+          # מארחי וידאו מוכרים של האתר
+          VALID_HOSTS = ["akamaized", "kaltura", "sport5", "cdn", "live"]
+
+          async def capture_and_download(context, item, idx):
+              url = item["url"]
               title = item.get("title", f"clip_{idx}")
-              url = item.get("url")
-              
               clean_title = re.sub(r'[\\/*?:"<>|]', "", title).strip() or f"clip_{idx}"
-              output_template = os.path.join(OUTPUT_DIR, f"{idx:02d} - {clean_title}.{idx:03d}")
 
               print(f"\n==========================================")
-              print(f"[DOWNLOAD_EXECUTION] #{idx}: {clean_title}")
-              print(f"[SOURCE_URL] {url}")
+              print(f"[PROCESSING] #{idx}: {clean_title}")
+              print(f"[PAGE_URL] {url}")
               print(f"==========================================")
 
-              # הגדרות הורדה ישירות באמצעות החולץ המובנה של האתר
-              ydl_opts = {
-                  'outtmpl': output_template,
-                  'format': 'bestvideo+bestaudio/best',
-                  'quiet': False,
-                  'no_warnings': True,
-                  'http_headers': {
-                      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-                  }
-              }
+              target_stream = None
+              page = await context.new_page()
+
+              # מאזין רשת ללכידת כתובת הזרמת הווידאו מהנגן
+              def on_request(req):
+                  nonlocal target_stream
+                  req_url = req.url
+                  
+                  # איתור קובץ m3u8 או mp4 ממקורות הווידאו
+                  if EXT_M3U8 in req_url and not target_stream:
+                      if any(h in req_url for h in VALID_HOSTS) or "master" in req_url or "playlist" in req_url:
+                          target_stream = req_url
+                          print(f"[INTERCEPTED_STREAM] {req_url}")
+                  elif EXT_MP4 in req_url and any(h in req_url for h in VALID_HOSTS) and not target_stream:
+                      target_stream = req_url
+                      print(f"[INTERCEPTED_MP4] {req_url}")
+
+              page.on("request", on_request)
 
               try:
-                  with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                      ydl.download([url])
-                  print(f"[SUCCESS] #{idx} downloaded and packaged successfully.")
+                  await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+                  await page.wait_for_timeout(2000)
+
+                  # לחיצה על כפתור הנגן להפעלת השידור במידה ואינו מתחיל אוטומטית
+                  if not target_stream:
+                      for frame in page.frames:
+                          try:
+                              elem = await frame.query_selector(".vjs-big-play-button, .play-icon, #player, .playBtn, button")
+                              if elem:
+                                  await elem.click(force=True)
+                          except Exception:
+                              pass
+
+                      for _ in range(8):
+                          if target_stream:
+                              break
+                          await page.wait_for_timeout(1000)
+
               except Exception as e:
-                  print(f"[DOWNLOAD_ERROR] Failed on #{idx}: {e}")
+                  print(f"[WARN] Navigation issue on {url}: {e}")
+
+              await page.close()
+
+              if target_stream:
+                  print(f"[DOWNLOADING_DIRECT] {target_stream}")
+                  output_template = os.path.join(OUTPUT_DIR, f"{idx:02d} - {clean_title}.{idx:03d}")
+                  ydl_opts = {
+                      'outtmpl': output_template,
+                      'format': 'bestvideo+bestaudio/best',
+                      'quiet': False,
+                      'no_warnings': True
+                  }
+                  try:
+                      with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                          ydl.download([target_stream])
+                      print(f"[SUCCESS] #{idx} saved to {output_template}")
+                  except Exception as e:
+                      print(f"[DOWNLOAD_FAILED] #{idx}: {e}")
+              else:
+                  print(f"[FAILED_INTERCEPT] Could not capture direct stream for {url}")
+
+          async def main():
+              if not batch_items:
+                  return
+
+              async with async_playwright() as p:
+                  browser = await p.chromium.launch(
+                      headless=True,
+                      args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"]
+                  )
+                  context = await browser.new_context(
+                      user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                      viewport={"width": 1920, "height": 1080}
+                  )
+
+                  for idx, item in enumerate(batch_items, 1):
+                      await capture_and_download(context, item, idx)
+
+                  await browser.close()
+
+          if __name__ == "__main__":
+              asyncio.run(main())
           PY
 
       - name: Upload batch artifact
