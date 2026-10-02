@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       request_id:
-        description: 'Unique process id (e.g. barca-123)'
+        description: 'Unique process id (e.g. req-123)'
         required: true
         type: string
 
@@ -62,8 +62,14 @@ jobs:
 
           async def fetch_nodes():
               async with async_playwright() as p:
-                  browser = await p.chromium.launch(headless=True)
-                  context = await browser.new_context()
+                  browser = await p.chromium.launch(
+                      headless=True,
+                      args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"]
+                  )
+                  context = await browser.new_context(
+                      user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                      viewport={"width": 1920, "height": 1080}
+                  )
                   page = await context.new_page()
                   
                   nodes, visited = [], set()
@@ -71,8 +77,10 @@ jobs:
                   for page_num in range(1, 6):
                       target = f"{SEARCH_URL}&p={page_num}" if page_num > 1 else SEARCH_URL
                       try:
-                          await page.goto(target, wait_until="domcontentloaded", timeout=30000)
-                          await page.wait_for_timeout(2000)
+                          resp = await page.goto(target, wait_until="domcontentloaded", timeout=30000)
+                          status_code = resp.status if resp else "none"
+                          print(f"[FETCH] Page {page_num} -> status {status_code}")
+                          await page.wait_for_timeout(2500)
                           
                           elements = await page.query_selector_all("a[href]")
                           for el in elements:
@@ -86,8 +94,8 @@ jobs:
                                       nodes.append({"url": full_url, "title": clean_title})
                                       if len(nodes) >= LIMIT_ITEMS:
                                           break
-                      except Exception:
-                          pass
+                      except Exception as e:
+                          print(f"[WARN] Error on page {page_num}: {e}")
                       
                       if len(nodes) >= LIMIT_ITEMS:
                           break
@@ -96,6 +104,7 @@ jobs:
                   return nodes
 
           items = asyncio.run(fetch_nodes())
+          print(f"[SUMMARY] Total items collected: {len(items)}")
 
           batches = [
               {"i": idx, "items": items[start:start + CHUNK_LIMIT]}
@@ -111,6 +120,7 @@ jobs:
   # ------------------------------------------------- step 2: parallel matrix downloads
   download-item:
     needs: enumerate
+    if: ${{ needs.enumerate.outputs.batches != '[]' && needs.enumerate.outputs.batches != '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 180
     continue-on-error: true
@@ -159,12 +169,12 @@ jobs:
 
               target_endpoint = None
               page = await context.new_page()
-              m3u8_sig = bytes.fromhex("2e6d337538").decode()
+              sig = bytes.fromhex("2e6d337538").decode()
 
               def handle_route(route, request):
                   nonlocal target_endpoint
                   req_url = request.url
-                  if m3u8_sig in req_url and not target_endpoint:
+                  if sig in req_url and not target_endpoint:
                       target_endpoint = req_url
                   route.continue_()
 
@@ -194,7 +204,6 @@ jobs:
               await page.close()
 
               if target_endpoint:
-                  # שומר ישירות בסיומת ממוספרת ללא mp4 (כגון .001, .002)
                   output_template = os.path.join(OUTPUT_DIR, f"{idx:02d} - {clean_title}.{idx:03d}")
                   ydl_opts = {
                       'outtmpl': output_template,
@@ -217,7 +226,10 @@ jobs:
                       headless=True,
                       args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"]
                   )
-                  context = await browser.new_context(viewport={"width": 1280, "height": 720})
+                  context = await browser.new_context(
+                      user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                      viewport={"width": 1280, "height": 720}
+                  )
 
                   for idx, item in enumerate(batch_items, 1):
                       await capture_stream(context, item, idx)
