@@ -11,8 +11,7 @@ on:
         type: choice
         options:
           - 'domestic_league'    # תקצירי ליגת העל בכדורגל
-          - 'european_league'    # תקצירי ליגת האלופות
-          - 'latest_feed'        # כל התקצירים האחרונים
+          - 'european_league'    # תקצירי ליגת האלxxxx	          - 'latest_feed'        # כל התקצירים האחרונים
           - 'query_search'       # חיפוש קבוצה ספציפית
       query:
         description: 'Search Query (בשימוש רק אם נבחר query_search)'
@@ -20,15 +19,10 @@ on:
         default: 'מכבי תל אביב'
         type: string
       scope:
-        description: 'מספר סרטונים להורדה'
+        description: 'מספר סרטונים להורדה (הזן מספר חופשי)'
         required: true
         default: '3'
-        type: choice
-        options:
-          - '1'
-          - '3'
-          - '5'
-          - '10'
+        type: string
       action_type:
         description: 'מצב פעולה'
         required: true
@@ -92,7 +86,15 @@ jobs:
 
           category = os.environ.get("CATEGORY", "domestic_league")
           raw_query = os.environ.get("QUERY", "").strip()
-          max_items = int(os.environ.get("SCOPE", "3"))
+          
+          # המרה בטוחה של כמות הסרטונים ממספר חופשי
+          try:
+              max_items = int(os.environ.get("SCOPE", "3").strip())
+              if max_items <= 0:
+                  max_items = 3
+          except ValueError:
+              max_items = 3
+
           action_type = os.environ.get("ACTION", "download")
           proxy_url = os.environ.get("PROXY_URL", "").strip()
 
