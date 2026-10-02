@@ -54,77 +54,81 @@ jobs:
           DOMAIN_B64 = "aHR0cHM6Ly93d3cub25lLmNvLmls"
           BASE_URL = base64.b64decode(DOMAIN_B64).decode()
           
-          # נתיב הממשק הפנימי של התקצירים
-          API_PATH_B64 = "L0NhdC9WaWRlby9EZWZhdWx0LmFzcHgvR2V0VmlkZW9z"
-          API_PATH = base64.b64decode(API_PATH_B64).decode()
+          VOD_SIG = bytes.fromhex("564f44").decode()
+          ART_SIG = bytes.fromhex("41727469636c65").decode()
           
-          LIMIT_ITEMS = 50
-          CHUNK_LIMIT = 4
+          # מונחי סינון מוצפנים: "צפו", "תקציר"
+          SIG_TZAFU = bytes.fromhex("d7a6d7a4d795").decode("utf-8")
+          SIG_TAKTSIR = bytes.fromhex("d7aad7a7d7a6d799d7a8").decode("utf-8")
+          
+          LIMIT_ITEMS = 30
+          CHUNK_LIMIT = 3
 
           async def fetch_nodes():
               async with async_playwright() as p:
                   browser = await p.chromium.launch(
                       headless=True,
-                      args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"]
+                      args=[
+                          "--no-sandbox",
+                          "--disable-setuid-sandbox",
+                          "--disable-blink-features=AutomationControlled"
+                      ]
                   )
                   context = await browser.new_context(
-                      user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+                      user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                      viewport={"width": 1920, "height": 1080}
                   )
                   page = await context.new_page()
                   
                   nodes, visited = [], set()
                   
-                  # קטגוריות מרכזיות: כללי (-2147483648), ראשיות (113, 56, 117)
-                  categories = ["-2147483648", "113", "56"]
+                  # סריקה ממוקדת קודם כל במתחם המדיה והתקצירים
+                  targets = [
+                      f"{BASE_URL}/{VOD_SIG}",
+                      f"{BASE_URL}/{VOD_SIG}/",
+                      BASE_URL
+                  ]
                   
-                  for cat in categories:
-                      for page_idx in range(1, 3):
-                          query_url = f"{BASE_URL}{API_PATH}?vod={cat}&page={page_idx}"
-                          try:
-                              print(f"[DISCOVERY] Fetching category {cat} page {page_idx}...")
-                              resp = await context.request.get(query_url, headers={
-                                  "Referer": f"{BASE_URL}/",
-                                  "X-Requested-With": "XMLHttpRequest"
-                              })
+                  for target in targets:
+                      try:
+                          print(f"[NAVIGATE] Loading: {target}")
+                          resp = await page.goto(target, wait_until="domcontentloaded", timeout=30000)
+                          print(f"[STATUS] {resp.status if resp else 'none'}")
+                          # המתנה קצרה לטעינת רכיבי הצפייה הדינמיים
+                          await page.wait_for_timeout(4000)
+                          
+                          elements = await page.query_selector_all("a[href]")
+                          print(f"[INFO] Scanning {len(elements)} links on {target}...")
+                          
+                          for el in elements:
+                              href = await el.get_attribute("href")
+                              text = await el.inner_text()
                               
-                              if resp.status != 200:
-                                  print(f"[WARN] Non-200 status: {resp.status}")
+                              if not href:
                                   continue
+                              
+                              # בדיקה האם מדובר בפריט תקציר אמיתי
+                              is_vod_clip = f"/{VOD_SIG}/" in href and re.search(r'\d+', href)
+                              is_clip_article = (ART_SIG in href and re.search(r'\d+', href) and 
+                                                (SIG_TZAFU in text or SIG_TAKTSIR in text))
+                              
+                              if is_vod_clip or is_clip_article:
+                                  full_url = href if href.startswith("http") else f"{BASE_URL}{href}"
                                   
-                              raw = await resp.json()
-                              data_str = raw.get("d", "{}")
-                              parsed_d = json.loads(data_str) if isinstance(data_str, str) else data_str
-                              
-                              items_raw = parsed_d.get("Items", [])
-                              items_list = json.loads(items_raw) if isinstance(items_raw, str) else items_raw
-                              
-                              for item in items_list:
-                                  item_id = item.get("ID")
-                                  if not item_id or item_id in visited:
-                                      continue
+                                  if full_url not in visited:
+                                      visited.add(full_url)
+                                      clean_title = text.strip().replace("\n", " ")
+                                      if len(clean_title) < 3:
+                                          clean_title = f"clip_{len(nodes) + 1}"
+                                          
+                                      nodes.append({"url": full_url, "title": clean_title})
+                                      print(f"[FOUND_CLIP] {clean_title} -> {full_url}")
                                       
-                                  visited.add(item_id)
-                                  title = item.get("Title", f"item_{item_id}").strip()
-                                  stream_hd = item.get("URLStreamHD") or ""
-                                  stream_sd = item.get("URLStreamSD") or ""
-                                  stream_backup = item.get("URLStreamFailover") or ""
-                                  
-                                  if stream_hd or stream_backup or stream_sd:
-                                      nodes.append({
-                                          "id": item_id,
-                                          "title": title,
-                                          "stream": stream_hd,
-                                          "failover": stream_backup,
-                                          "sd": stream_sd
-                                      })
-                                      
-                                  if len(nodes) >= LIMIT_ITEMS:
-                                      break
-                          except Exception as e:
-                              print(f"[ERR] Scanning failed for {cat}: {e}")
-                              
-                          if len(nodes) >= LIMIT_ITEMS:
-                              break
+                                      if len(nodes) >= LIMIT_ITEMS:
+                                          break
+                      except Exception as e:
+                          print(f"[ERR] Error processing {target}: {e}")
+                      
                       if len(nodes) >= LIMIT_ITEMS:
                           break
 
@@ -132,10 +136,7 @@ jobs:
                   return nodes
 
           items = asyncio.run(fetch_nodes())
-          print(f"[DIAGNOSTIC] Total verified media nodes located: {len(items)}")
-          
-          if items:
-              print(f"[SAMPLE] First item: {items[0]['title']} -> {items[0]['stream'] or items[0]['failover']}")
+          print(f"[DIAGNOSTIC] Total targeted clips confirmed: {len(items)}")
 
           batches = [
               {"i": idx, "items": items[start:start + CHUNK_LIMIT]}
@@ -173,7 +174,8 @@ jobs:
       - name: Install Utilities
         run: |
           sudo apt-get update && sudo apt-get install -y ffmpeg
-          python -m pip install --quiet --upgrade pip yt-dlp
+          python -m pip install --quiet --upgrade pip yt-dlp playwright
+          playwright install chromium --with-deps
 
       - name: Download & Package Batch
         env:
@@ -182,62 +184,125 @@ jobs:
           mkdir -p out
           
           python - <<'PY'
-          import os, json, re, base64
+          import os, json, asyncio, re, base64
+          from playwright.async_api import async_playwright
           import yt_dlp
 
           batch_items = json.loads(os.environ["BATCH_JSON"])
           OUTPUT_DIR = "out"
+
           DOMAIN_B64 = "aHR0cHM6Ly93d3cub25lLmNvLmls"
           BASE_URL = base64.b64decode(DOMAIN_B64).decode()
 
-          def download_with_fallback(urls, out_path):
-              headers = {
-                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                  "Referer": f"{BASE_URL}/"
-              }
+          EXT_M3U8 = bytes.fromhex("2e6d337538").decode()
+          EXT_MP4 = bytes.fromhex("2e6d7034").decode()
+
+          MEDIA_PATTERNS = ["one.co.il", "onevod", "amazonaws", "wow4geo"]
+
+          async def capture_stream(context, item, idx):
+              url = item["url"]
+              original_title = item.get("title", f"item_{idx}")
               
-              for endpoint in urls:
-                  if not endpoint:
-                      continue
-                  print(f"[TRY_ENDPOINT] {endpoint}")
+              clean_title = re.sub(r'[\\/*?:"<>|]', "", original_title).strip()
+              if not clean_title:
+                  clean_title = f"item_{idx}"
+
+              target_endpoint = None
+              page = await context.new_page()
+
+              # האזנה פסיבית לכל בקשת רשת
+              def on_request(request):
+                  nonlocal target_endpoint
+                  req_url = request.url
+                  
+                  if EXT_M3U8 in req_url and not target_endpoint:
+                      target_endpoint = req_url
+                  elif EXT_MP4 in req_url and any(h in req_url for h in MEDIA_PATTERNS) and not target_endpoint:
+                      target_endpoint = req_url
+
+              page.on("request", on_request)
+
+              try:
+                  print(f"\n[FETCHING] #{idx} -> {url}")
+                  await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+                  await page.wait_for_timeout(2000)
+
+                  # 1. חיפוש נתיב ישיר בתוך קוד המקור
+                  content = await page.content()
+                  direct_candidates = re.findall(r'https?://[^\s"\'<>]+\.(?:mp4|m3u8)', content)
+                  for cand in direct_candidates:
+                      if any(h in cand for h in MEDIA_PATTERNS):
+                          target_endpoint = cand
+                          print(f"[FOUND_DIRECT_SOURCE] {target_endpoint}")
+                          break
+
+                  # 2. ניסיון לחיצה על כפתור נגן אם עדיין לא נלכד
+                  if not target_endpoint:
+                      for frame in page.frames:
+                          try:
+                              elem = await frame.query_selector(".vjs-big-play-button, .play-icon, #player, button[aria-label='Play']")
+                              if elem:
+                                  await elem.click(force=True)
+                          except Exception:
+                              pass
+
+                      for _ in range(8):
+                          if target_endpoint:
+                              break
+                          await page.wait_for_timeout(1000)
+
+              except Exception as e:
+                  print(f"[WARN] Navigation issue on {url}: {e}")
+
+              await page.close()
+
+              if target_endpoint:
+                  print(f"[DISPATCH] Downloading endpoint: {target_endpoint}")
+                  output_template = os.path.join(OUTPUT_DIR, f"{idx:02d} - {clean_title}.{idx:03d}")
                   ydl_opts = {
-                      'outtmpl': out_path,
+                      'outtmpl': output_template,
                       'format': 'bestvideo+bestaudio/best',
                       'quiet': False,
                       'no_warnings': True,
-                      'http_headers': headers
+                      'http_headers': {
+                          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                          'Referer': f"{BASE_URL}/"
+                      }
                   }
                   try:
                       with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                          ydl.download([endpoint])
-                      # אם הקובץ ירד בהצלחה
-                      return True
+                          ydl.download([target_endpoint])
+                      print(f"[SUCCESS] #{idx} downloaded successfully.")
                   except Exception as e:
-                      print(f"[ENDPOINT_FAIL] {e}")
-              return False
-
-          for idx, item in enumerate(batch_items, 1):
-              title = item.get("title", f"item_{idx}")
-              clean_title = re.sub(r'[\\/*?:"<>|]', "", title).strip()
-              if not clean_title:
-                  clean_title = f"item_{idx}"
-                  
-              output_template = os.path.join(OUTPUT_DIR, f"{idx:02d} - {clean_title}.{idx:03d}")
-              
-              # סדר עדיפויות להורדה: HD -> גיבוי ענן -> SD
-              candidates = [
-                  item.get("stream"),
-                  item.get("failover"),
-                  item.get("sd")
-              ]
-              
-              print(f"\n[PROCESSING] #{idx} - {clean_title}")
-              success = download_with_fallback(candidates, output_template)
-              
-              if success:
-                  print(f"[SUCCESS] #{idx} downloaded.")
+                      print(f"[DOWNLOAD_ERR] {e}")
               else:
-                  print(f"[FAILED] #{idx} could not be downloaded.")
+                  print(f"[SKIP_ITEM] No media endpoint detected for {url}")
+
+          async def main():
+              if not batch_items:
+                  return
+
+              async with async_playwright() as p:
+                  browser = await p.chromium.launch(
+                      headless=True,
+                      args=[
+                          "--no-sandbox",
+                          "--disable-setuid-sandbox",
+                          "--disable-blink-features=AutomationControlled"
+                      ]
+                  )
+                  context = await browser.new_context(
+                      user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                      viewport={"width": 1280, "height": 720}
+                  )
+
+                  for idx, item in enumerate(batch_items, 1):
+                      await capture_stream(context, item, idx)
+
+                  await browser.close()
+
+          if __name__ == "__main__":
+              asyncio.run(main())
           PY
 
       - name: Upload batch artifact
