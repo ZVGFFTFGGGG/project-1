@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       request_id:
-        description: 'Unique process id (e.g. barca-123)'
+        description: 'Unique process id (e.g. probe-101)'
         required: true
         type: string
 
@@ -17,7 +17,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # ------------------------------------------------- step 1: target extraction
+  # ------------------------------------------------- step 1: discovery & queuing
   enumerate:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -41,86 +41,111 @@ jobs:
 
       - name: Install System Dependencies
         run: |
-          python -m pip install --quiet --upgrade pip yt-dlp
+          python -m pip install --quiet --upgrade pip playwright
+          playwright install chromium --with-deps
 
       - name: Scan Target Engine & Structure Batches
         id: list
         run: |
           python - <<'PY'
-          import os, json, secrets, base64, subprocess
+          import os, json, secrets, asyncio, base64, re
+          from playwright.async_api import async_playwright
 
-          SRC_B64 = "aHR0cHM6Ly93d3cueW91dHViZS5jb20vQG9uZS0xMDA0L3ZpZGVvcw=="
-          SRC_URL = base64.b64decode(SRC_B64).decode()
+          # קידוד דומיין המטרה היציב
+          TARGET_HOST_B64 = "aHR0cHM6Ly93d3cuc3BvcnQ1LmNvLmls"
+          BASE_URL = base64.b64decode(TARGET_HOST_B64).decode()
 
-          REQ_RAW = "${{ inputs.request_id }}".lower()
+          # מונחי סינון מוצפנים: "צפו", "תקציר"
+          SIG_TZAFU = bytes.fromhex("d7a6d7a4d795").decode("utf-8")
+          SIG_TAKTSIR = bytes.fromhex("d7aad7a7d7a6d799d7a8").decode("utf-8")
+          ART_PATH = "articles.aspx"
+
+          REQ_FILTER = "${{ inputs.request_id }}".lower()
           LIMIT_ITEMS = 12
           CHUNK_LIMIT = 2
 
-          print(f"[EXTRACTOR] Fetching clip inventory...")
+          async def harvest_clips():
+              async with async_playwright() as p:
+                  browser = await p.chromium.launch(
+                      headless=True,
+                      args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"]
+                  )
+                  context = await browser.new_context(
+                      user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                      viewport={"width": 1920, "height": 1080}
+                  )
+                  page = await context.new_page()
 
-          cmd = [
-              "yt-dlp",
-              "--flat-playlist",
-              "--dump-json",
-              "--playlist-end", "50",
-              SRC_URL
-          ]
+                  print(f"[HARVESTER] Accessing source: {BASE_URL}")
+                  await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=30000)
+                  await page.evaluate("window.scrollTo(0, 1200)")
+                  await page.wait_for_timeout(3000)
 
-          res = subprocess.run(cmd, capture_output=True, text=True)
-          nodes = []
+                  elements = await page.query_selector_all(f"a[href*='{ART_PATH}']")
+                  print(f"[INFO] Discovered {len(elements)} article links.")
 
-          for line in res.stdout.strip().split("\n"):
-              if not line:
-                  continue
-              try:
-                  entry = json.loads(line)
-                  title = entry.get("title", "")
-                  v_id = entry.get("id") or entry.get("url")
-                  
-                  if not v_id or not title:
-                      continue
+                  nodes, visited = [], set()
 
-                  title_low = title.lower()
-                  # סינון תקצירי ברצלונה / בארסה
-                  if any(k in title_low for k in ["barca", "barcelona", "ברצלונה", "בארסה"]):
-                      target_url = f"https://www.youtube.com/watch?v={v_id}" if not str(v_id).startswith("http") else str(v_id)
-                      nodes.append({"id": v_id, "title": title, "url": target_url})
-                      print(f"[MATCH_FOUND] {title}")
-                      
-                      if len(nodes) >= LIMIT_ITEMS:
-                          break
-              except Exception:
-                  pass
+                  for el in elements:
+                      href = await el.get_attribute("href")
+                      text = await el.inner_text()
+                      if not href:
+                          continue
 
-          # אם הועלו מעט מחזורים ברצף האחרון, נמלא ביתר התקצירים האחרונים
-          if len(nodes) < 2:
-              for line in res.stdout.strip().split("\n"):
-                  if not line or len(nodes) >= LIMIT_ITEMS:
-                      break
-                  try:
-                      entry = json.loads(line)
-                      title = entry.get("title", "")
-                      v_id = entry.get("id") or entry.get("url")
-                      target_url = f"https://www.youtube.com/watch?v={v_id}" if not str(v_id).startswith("http") else str(v_id)
-                      if not any(n["url"] == target_url for n in nodes):
-                          nodes.append({"id": v_id, "title": title, "url": target_url})
-                  except Exception:
-                      pass
+                      full_url = href if href.startswith("http") else f"{BASE_URL}/{href.lstrip('/')}"
+                      clean_text = text.strip().replace("\n", " ")
 
-          print(f"\n[SUMMARY] Total confirmed clips prepared: {len(nodes)}")
+                      # זיהוי כתבות המכילות סרטון מובנה
+                      is_clip_entry = (SIG_TZAFU in clean_text or SIG_TAKTSIR in clean_text)
+
+                      if is_clip_entry and full_url not in visited:
+                          visited.add(full_url)
+                          
+                          # סינון לפי מזהה הבקשה אם הוזן מונח ספציפי
+                          if any(k in REQ_FILTER for k in ["barca", "maccabi", "madrid", "nba"]):
+                              key = REQ_FILTER.split("-")[0]
+                              if key not in clean_text.lower():
+                                  continue
+
+                          nodes.append({"url": full_url, "title": clean_text})
+                          print(f"[MATCH_FOUND] {clean_text} -> {full_url}")
+
+                          if len(nodes) >= LIMIT_ITEMS:
+                              break
+
+                  # רשת ביטחון: במידה ולא נבחר פילטר מיוחד, נוודא שלפחות 4 אייטמים מובילים ירדו
+                  if len(nodes) < 2:
+                      for el in elements:
+                          href = await el.get_attribute("href")
+                          text = await el.inner_text()
+                          if not href:
+                              continue
+                          full_url = href if href.startswith("http") else f"{BASE_URL}/{href.lstrip('/')}"
+                          clean_text = text.strip().replace("\n", " ")
+                          if (SIG_TZAFU in clean_text or SIG_TAKTSIR in clean_text) and full_url not in visited:
+                              visited.add(full_url)
+                              nodes.append({"url": full_url, "title": clean_text})
+                              if len(nodes) >= 4:
+                                  break
+
+                  await browser.close()
+                  return nodes
+
+          items = asyncio.run(harvest_clips())
+          print(f"\n[SUMMARY] Total confirmed video entries queued: {len(items)}")
 
           batches = [
-              {"i": idx, "items": nodes[start:start + CHUNK_LIMIT]}
-              for idx, start in enumerate(range(0, len(nodes), CHUNK_LIMIT))
+              {"i": idx, "items": items[start:start + CHUNK_LIMIT]}
+              for idx, start in enumerate(range(0, len(items), CHUNK_LIMIT))
           ]
 
           delim = f"ghadelim_{secrets.token_hex(8)}"
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
               f.write(f"batches<<{delim}\n{json.dumps(batches)}\n{delim}\n")
-              f.write(f"count={len(nodes)}\n")
+              f.write(f"count={len(items)}\n")
           PY
 
-  # ------------------------------------------------- step 2: parallel matrix downloads
+  # ------------------------------------------------- step 2: parallel download execution
   download-item:
     needs: enumerate
     if: ${{ needs.enumerate.outputs.batches != '[]' && needs.enumerate.outputs.batches != '' }}
@@ -160,54 +185,35 @@ jobs:
           batch_items = json.loads(os.environ["BATCH_JSON"])
           OUTPUT_DIR = "out"
 
-          # רשימת לקוחות שאינם דורשים אימות בוט בשרתי ענן
-          CLIENT_COMBINATIONS = [
-              ['mweb'],
-              ['ios'],
-              ['web_creator'],
-              ['android', 'mweb']
-          ]
-
-          def execute_download(target_url, out_path):
-              for clients in CLIENT_COMBINATIONS:
-                  print(f"[TRY_CLIENTS] Attempting download using clients: {clients}")
-                  ydl_opts = {
-                      'outtmpl': out_path,
-                      'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-                      'quiet': False,
-                      'no_warnings': True,
-                      'geo_bypass': True,
-                      'geo_bypass_country': 'IL',
-                      'extractor_args': {
-                          'youtube': {
-                              'player_client': clients,
-                              'player_skip': ['configs', 'webpage']
-                          }
-                      }
-                  }
-                  try:
-                      with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                          ydl.download([target_url])
-                      print(f"[SUCCESS_CLIENT] Downloaded successfully using {clients}")
-                      return True
-                  except Exception as e:
-                      print(f"[CLIENT_FAILED] {clients} failed: {e}")
-              return False
-
           for idx, item in enumerate(batch_items, 1):
-              title = item.get("title", f"item_{idx}")
+              title = item.get("title", f"clip_{idx}")
               url = item.get("url")
               
-              clean_title = re.sub(r'[\\/*?:"<>|]', "", title).strip() or f"item_{idx}"
+              clean_title = re.sub(r'[\\/*?:"<>|]', "", title).strip() or f"clip_{idx}"
               output_template = os.path.join(OUTPUT_DIR, f"{idx:02d} - {clean_title}.{idx:03d}")
 
-              print(f"\n[PROCESSING] #{idx}: {clean_title}")
-              success = execute_download(url, output_template)
-              
-              if success:
-                  print(f"[SUCCESS] #{idx} saved to {output_template}")
-              else:
-                  print(f"[FAILED] #{idx} could not bypass bot check.")
+              print(f"\n==========================================")
+              print(f"[DOWNLOAD_EXECUTION] #{idx}: {clean_title}")
+              print(f"[SOURCE_URL] {url}")
+              print(f"==========================================")
+
+              # הגדרות הורדה ישירות באמצעות החולץ המובנה של האתר
+              ydl_opts = {
+                  'outtmpl': output_template,
+                  'format': 'bestvideo+bestaudio/best',
+                  'quiet': False,
+                  'no_warnings': True,
+                  'http_headers': {
+                      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+                  }
+              }
+
+              try:
+                  with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                      ydl.download([url])
+                  print(f"[SUCCESS] #{idx} downloaded and packaged successfully.")
+              except Exception as e:
+                  print(f"[DOWNLOAD_ERROR] Failed on #{idx}: {e}")
           PY
 
       - name: Upload batch artifact
