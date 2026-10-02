@@ -37,7 +37,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.12'
 
       - name: Install System Dependencies
         run: |
@@ -49,26 +49,20 @@ jobs:
           python - <<'PY'
           import os, json, secrets, base64, subprocess
 
-          # קידוד מקור התוכן הרשמי
           SRC_B64 = "aHR0cHM6Ly93d3cueW91dHViZS5jb20vQG9uZS0xMDA0L3ZpZGVvcw=="
           SRC_URL = base64.b64decode(SRC_B64).decode()
 
           REQ_RAW = "${{ inputs.request_id }}".lower()
-          # מילות מפתח ממוקדות: ברצלונה / בארסה / barca
-          KEYWORDS = ["barca", "barcelona", "ברצלונה", "בארסה", "highlights", "תקציר"]
-          
           LIMIT_ITEMS = 12
           CHUNK_LIMIT = 2
 
-          print(f"[EXTRACTOR] Probing official content source...")
+          print(f"[EXTRACTOR] Fetching clip inventory...")
 
-          # שליפת רשימת הקטעים עם עקיפת חסימה גיאוגרפית ישראלית
           cmd = [
               "yt-dlp",
               "--flat-playlist",
               "--dump-json",
-              "--geo-bypass-country", "IL",
-              "--playlist-end", "60",
+              "--playlist-end", "50",
               SRC_URL
           ]
 
@@ -87,7 +81,7 @@ jobs:
                       continue
 
                   title_low = title.lower()
-                  # סינון תקצירי ברצלונה
+                  # סינון תקצירי ברצלונה / בארסה
                   if any(k in title_low for k in ["barca", "barcelona", "ברצלונה", "בארסה"]):
                       target_url = f"https://www.youtube.com/watch?v={v_id}" if not str(v_id).startswith("http") else str(v_id)
                       nodes.append({"id": v_id, "title": title, "url": target_url})
@@ -113,7 +107,7 @@ jobs:
                   except Exception:
                       pass
 
-          print(f"\n[SUMMARY] Total confirmed match items prepared: {len(nodes)}")
+          print(f"\n[SUMMARY] Total confirmed clips prepared: {len(nodes)}")
 
           batches = [
               {"i": idx, "items": nodes[start:start + CHUNK_LIMIT]}
@@ -146,7 +140,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.12'
 
       - name: Install Utilities
         run: |
@@ -160,55 +154,44 @@ jobs:
           mkdir -p out
           
           python - <<'PY'
-          import os, json, re, subprocess
+          import os, json, re
           import yt_dlp
 
           batch_items = json.loads(os.environ["BATCH_JSON"])
           OUTPUT_DIR = "out"
 
-          # רשימת כתובות IP ישראליות לזיוף Header במקרה של חסימה גיאוגרפית
-          IL_IPS = ["212.179.1.1", "82.166.1.1", "192.114.1.1"]
+          # רשימת לקוחות שאינם דורשים אימות בוט בשרתי ענן
+          CLIENT_COMBINATIONS = [
+              ['mweb'],
+              ['ios'],
+              ['web_creator'],
+              ['android', 'mweb']
+          ]
 
           def execute_download(target_url, out_path):
-              # ניסיון 1: הורדה ישירה עם דגל עקיפה גיאוגרפי של ישראל
-              ydl_opts_direct = {
-                  'outtmpl': out_path,
-                  'format': 'bestvideo+bestaudio/best',
-                  'quiet': False,
-                  'no_warnings': True,
-                  'geo_bypass': True,
-                  'geo_bypass_country': 'IL',
-                  'http_headers': {
-                      'X-Forwarded-For': IL_IPS[0],
-                      'Client-IP': IL_IPS[0]
-                  }
-              }
-              try:
-                  print(f"[TRY_DOWNLOAD] Standard with IL-GeoBypass: {target_url}")
-                  with yt_dlp.YoutubeDL(ydl_opts_direct) as ydl:
-                      ydl.download([target_url])
-                  return True
-              except Exception as e:
-                  print(f"[DIRECT_FAILED] {e}")
-
-              # ניסיון 2: משיכה דרך פרוקסי עוקף מגבלות מיקום
-              try:
-                  print(f"[RETRY] Using open extractor bridge...")
-                  alt_opts = {
+              for clients in CLIENT_COMBINATIONS:
+                  print(f"[TRY_CLIENTS] Attempting download using clients: {clients}")
+                  ydl_opts = {
                       'outtmpl': out_path,
-                      'format': 'bestvideo+bestaudio/best',
+                      'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
                       'quiet': False,
                       'no_warnings': True,
                       'geo_bypass': True,
                       'geo_bypass_country': 'IL',
-                      'extractor_args': {'youtube': {'player_client': ['android', 'web']}}
+                      'extractor_args': {
+                          'youtube': {
+                              'player_client': clients,
+                              'player_skip': ['configs', 'webpage']
+                          }
+                      }
                   }
-                  with yt_dlp.YoutubeDL(alt_opts) as ydl:
-                      ydl.download([target_url])
-                  return True
-              except Exception as e2:
-                  print(f"[BRIDGE_FAILED] {e2}")
-
+                  try:
+                      with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                          ydl.download([target_url])
+                      print(f"[SUCCESS_CLIENT] Downloaded successfully using {clients}")
+                      return True
+                  except Exception as e:
+                      print(f"[CLIENT_FAILED] {clients} failed: {e}")
               return False
 
           for idx, item in enumerate(batch_items, 1):
@@ -222,9 +205,9 @@ jobs:
               success = execute_download(url, output_template)
               
               if success:
-                  print(f"[SUCCESS] #{idx} downloaded.")
+                  print(f"[SUCCESS] #{idx} saved to {output_template}")
               else:
-                  print(f"[FAILED] #{idx} could not be bypassed.")
+                  print(f"[FAILED] #{idx} could not bypass bot check.")
           PY
 
       - name: Upload batch artifact
