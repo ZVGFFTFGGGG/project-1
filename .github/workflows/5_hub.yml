@@ -7,12 +7,12 @@ on:
       category:
         description: 'Target Category'
         required: true
-        default: 'domestic_league'
+        default: 'latest_feed'
         type: choice
         options:
-          - 'domestic_league'    # תקצירי ליגת העל בכדורגל
-          - 'european_league'    # תקצירי ליגת האלופות
-          - 'latest_feed'        # כל התקצירים האחרונים
+          - 'latest_feed'        # כל התקצירים האחרונים (כל הענפים)
+          - 'domestic_league'    # כדורגל ישראלי וליגת העל
+          - 'european_league'    # ליגת האלופות ואירופה
           - 'query_search'       # חיפוש קבוצה ספציפית
       query:
         description: 'Search Query (בשימוש רק אם נבחר query_search)'
@@ -82,11 +82,10 @@ jobs:
           PROXY_URL: ${{ inputs.proxy_url }}
         run: |
           python - <<'PY'
-          import urllib.request, urllib.parse, re, os, sys, html, json, threading
-          from concurrent.futures import ThreadPoolExecutor
+          import urllib.request, urllib.parse, re, os, sys, html, json, time
           from bs4 import BeautifulSoup
 
-          category = os.environ.get("CATEGORY", "domestic_league")
+          category = os.environ.get("CATEGORY", "latest_feed")
           raw_query = os.environ.get("QUERY", "").strip()
 
           try:
@@ -133,9 +132,26 @@ jobs:
               t = re.sub(r'[ /\\:*?"<>|]+', '_', t)
               return t.strip('_')[:80] or "video_item"
 
-          def extract_clean_stream_from_html(page_html):
-              # 1. JSON-LD structured data
+          def extract_link_title(a_tag):
+              if a_tag.get("title"):
+                  return a_tag["title"].strip()
+              img = a_tag.find("img")
+              if img and img.get("alt"):
+                  return img["alt"].strip()
+              h = a_tag.find(["h1", "h2", "h3", "h4"])
+              if h and h.get_text(strip=True):
+                  return h.get_text(strip=True)
+              txt = a_tag.get_text(strip=True)
+              return txt if txt else ""
+
+          def extract_clean_stream(page_url):
+              """הפונקציה המקורית שפעלה בהצלחה מלאה"""
               try:
+                  req = urllib.request.Request(page_url, headers=headers)
+                  with opener.open(req, timeout=12) as r:
+                      page_html = r.read().decode("utf-8", errors="ignore")
+
+                  # 1. JSON-LD structured data
                   soup = BeautifulSoup(page_html, "html.parser")
                   for script in soup.find_all("script", type="application/ld+json"):
                       try:
@@ -151,34 +167,46 @@ jobs:
                                           return clean.split(".m3u8")[0] + ".m3u8"
                       except Exception:
                           continue
+
+                  # 2. watch.sport5.co.il player regex
+                  match_watch = re.search(r'watch\.sport5\.co\.il/?\?src=([^"\'<>\s]+)', page_html)
+                  if match_watch:
+                      raw_src = urllib.parse.unquote(match_watch.group(1))
+                      clean = raw_src.split("___")[0].split("\\u0026")[0].split("&")[0].strip()
+                      if ".m3u8" in clean:
+                          return clean.split(".m3u8")[0] + ".m3u8"
+
+                  # 3. Akamai direct m3u8 search
+                  matches = re.findall(r'(https?%3A%2F%2F[^\s"\'<>]+\.m3u8[^\s"\'<>]*|https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*)', page_html)
+                  for stream in matches:
+                      decoded = urllib.parse.unquote(stream)
+                      if "src=" in decoded:
+                          decoded = decoded.split("src=")[-1]
+                      clean = decoded.split("___")[0].split("&")[0].strip()
+                      if ".m3u8" in clean:
+                          return clean.split(".m3u8")[0] + ".m3u8"
               except Exception:
                   pass
-
-              # 2. watch.sport5.co.il player regex
-              match_watch = re.search(r'watch\.sport5\.co\.il/?\?src=([^"\'<>\s]+)', page_html)
-              if match_watch:
-                  raw_src = urllib.parse.unquote(match_watch.group(1))
-                  clean = raw_src.split("___")[0].split("\\u0026")[0].split("&")[0].strip()
-                  if ".m3u8" in clean:
-                      return clean.split(".m3u8")[0] + ".m3u8"
-
-              # 3. Akamai direct m3u8 search
-              matches = re.findall(r'(https?%3A%2F%2F[^\s"\'<>]+\.m3u8[^\s"\'<>]*|https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*)', page_html)
-              for stream in matches:
-                  decoded = urllib.parse.unquote(stream)
-                  if "src=" in decoded:
-                      decoded = decoded.split("src=")[-1]
-                  clean = decoded.split("___")[0].split("&")[0].strip()
-                  if ".m3u8" in clean:
-                      return clean.split(".m3u8")[0] + ".m3u8"
-
               return None
 
-          candidates = []
-          seen_links = set()
-          doc_ids = []
+          candidates_dict = {}
 
-          print("Step 1: Gathering latest links from news-sitemap.xml...")
+          def register_candidate(link, title):
+              link = html.unescape(link.strip())
+              if not link.startswith("http"):
+                  link = f"https://www.sport5.co.il/{link.lstrip('/')}"
+              if "articles.aspx" in link and "docid=" in link.lower():
+                  m = re.search(r'docid=(\d+)', link, re.I)
+                  doc_id = int(m.group(1)) if m else 0
+                  if link not in candidates_dict:
+                      candidates_dict[link] = {
+                          "url": link,
+                          "title": title,
+                          "doc_id": doc_id
+                      }
+
+          # 1. משיכת חדשות אחרונות מ-sitemap (ה-124 הראשונים)
+          print("Step 1: Gathering sitemap articles...")
           try:
               s_url = "https://www.sport5.co.il/sitemap/articles/news-sitemap.xml"
               req = urllib.request.Request(s_url, headers=headers)
@@ -188,91 +216,90 @@ jobs:
                       loc_m = re.search(r'<loc>(.*?)</loc>', block)
                       title_m = re.search(r'<news:title>(.*?)</news:title>', block) or re.search(r'<title>(.*?)</title>', block)
                       if loc_m:
-                          loc = html.unescape(loc_m.group(1).strip())
-                          title = clean_title(html.unescape(title_m.group(1).strip()) if title_m else "")
-                          if loc not in seen_links:
-                              seen_links.add(loc)
-                              candidates.append((loc, title))
-                              did_match = re.search(r'docid=(\d+)', loc, re.I)
-                              if did_match:
-                                  doc_ids.append(int(did_match.group(1)))
+                          loc = loc_m.group(1).strip()
+                          t = clean_title(title_m.group(1).strip() if title_m else "")
+                          register_candidate(loc, t)
           except Exception as e:
               print(f"Sitemap note: {e}")
 
-          print(f"Found {len(candidates)} recent articles in sitemap.")
+          print(f"Found {len(candidates_dict)} items from sitemap.")
 
-          # Step 2: אם המשתמש ביקש כמות גדולה, ממשיכים אחורה בארכיון לפי מזהי ה-docID של ספורט 5
-          if len(candidates) < (max_items * 3.5) and doc_ids:
-              min_doc_id = min(doc_ids)
-              needed = int((max_items * 3.5) - len(candidates))
-              print(f"Expanding archive: queuing {needed} past articles backward from docID {min_doc_id}...")
-              for past_id in range(min_doc_id - 1, min_doc_id - needed - 1, -1):
-                  loc = f"https://www.sport5.co.il/articles.aspx?FolderID=44&docID={past_id}"
-                  if loc not in seen_links:
-                      seen_links.add(loc)
-                      candidates.append((loc, ""))
+          # 2. משיכת מאות כתבות נוספות ממדורי האתר הפעילים
+          folder_ids = [
+              44,   # ליגת העל בכדורגל
+              64,   # כדורגל ישראלי
+              45,   # ליגה לאומית
+              21,   # כדורגל עולמי
+              397,  # ליגת האלופות
+              58,   # ליגה אנגלית
+              60,   # ליגה ספרדית
+              61,   # ליגה איטלקית
+              17,   # כדורסל ראשי
+              405,  # ליגת ווינר סל
+              415,  # יורוליג
+              175,  # NBA
+              201,  # טניס וענפים נוספים
+              218,  # UFC ולחימה
+              55,   # נבחרת ישראל
+              77,   # מכבי ת"א
+              78,   # מכבי חיפה
+              80,   # בית"ר ירושלים
+              81,   # הפועל ב"ש
+              79,   # הפועל ת"א
+              134,  # מכבי ת"א כדורסל
+              136   # הפועל ת"א כדורסל
+          ]
 
-          print(f"Total candidate articles ready to inspect: {len(candidates)}")
-
-          resolved_items = []
-          seen_streams = set()
-          lock = threading.Lock()
-          stop_event = threading.Event()
-
-          def process_candidate(item):
-              if stop_event.is_set():
-                  return
-              loc, known_title = item
+          print(f"Step 2: Scanning site category hubs to expand candidates pool...")
+          for fid in folder_ids:
+              if len(candidates_dict) >= (max_items * 3.5):
+                  break
+              cat_url = f"https://www.sport5.co.il/category.aspx?FolderID={fid}"
               try:
-                  req = urllib.request.Request(loc, headers=headers)
-                  with opener.open(req, timeout=10) as r:
-                      page_html = r.read().decode("utf-8", errors="ignore")
-
-                  stream = extract_clean_stream_from_html(page_html)
-                  if not stream:
-                      return
-
-                  # חילוץ הכותרת אם היא לא הייתה ידועה מראש
-                  title = known_title
-                  if not title:
-                      soup = BeautifulSoup(page_html, "html.parser")
-                      og_title = soup.find("meta", property="og:title")
-                      if og_title and og_title.get("content"):
-                          title = clean_title(og_title["content"])
-                      elif soup.title and soup.title.string:
-                          title = clean_title(soup.title.string)
-                      else:
-                          title = "video_item"
-
-                  if category == "query_search":
-                      t_low = title.lower()
-                      l_low = loc.lower()
-                      if not any(k in t_low or k in l_low for k in search_keys):
-                          return
-
-                  with lock:
-                      if len(resolved_items) >= max_items:
-                          stop_event.set()
-                          return
-                      if stream not in seen_streams:
-                          seen_streams.add(stream)
-                          resolved_items.append({
-                              "stream": stream,
-                              "title": title,
-                              "page": loc
-                          })
-                          print(f"[{len(resolved_items)}/{max_items}] [+] Found video highlight: {title[:50]}")
-                          if len(resolved_items) >= max_items:
-                              stop_event.set()
+                  req = urllib.request.Request(cat_url, headers=headers)
+                  with opener.open(req, timeout=8) as resp:
+                      soup = BeautifulSoup(resp.read().decode("utf-8", errors="ignore"), "html.parser")
+                      for a in soup.find_all("a", href=True):
+                          h = a["href"]
+                          if "articles.aspx" in h and "docid=" in h.lower():
+                              t = clean_title(extract_link_title(a))
+                              register_candidate(h, t)
               except Exception:
                   pass
 
-          # סריקה מקבילית ומהירה ב-10 תהליכונים
-          print(f"Inspecting pages with 10 parallel workers until reaching {max_items} videos...")
-          with ThreadPoolExecutor(max_workers=10) as executor:
-              executor.map(process_candidate, candidates)
+          # סידור כל המועמדים לפי זמן הפרסום (doc_id הגבוה ביותר הוא הכי חדש)
+          candidates = list(candidates_dict.values())
+          candidates.sort(key=lambda x: x["doc_id"], reverse=True)
+          print(f"Total unique articles gathered: {len(candidates)} (sorted newest to oldest).")
 
-          print(f"\nFinal catalog count: {len(resolved_items)} / {max_items} videos collected.")
+          resolved_items = []
+          seen_streams = set()
+
+          print(f"\nResolving video highlights sequentially until reaching {max_items}...")
+          for item in candidates:
+              if len(resolved_items) >= max_items:
+                  break
+
+              loc = item["url"]
+              page_title = item["title"]
+
+              t_low = page_title.lower()
+              l_low = loc.lower()
+
+              match = True
+              if category == "query_search":
+                  match = any(k in t_low or k in l_low for k in search_keys)
+
+              if match:
+                  stream = extract_clean_stream(loc)
+                  if stream and stream not in seen_streams:
+                      seen_streams.add(stream)
+                      resolved_items.append({
+                          "stream": stream,
+                          "title": page_title,
+                          "page": loc
+                      })
+                      print(f"[{len(resolved_items)}/{max_items}] [+] Found video highlight: {page_title[:55]}")
 
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
               summary.write(f"## Sport5 Catalog Summary\n\n")
